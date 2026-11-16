@@ -1511,9 +1511,9 @@ namespace TileBoard
         }
 
         /// <summary>
-        /// 改名链路自检：直接走 BeginRenameGroup（双击识别、右键改名、新建分组自动命名
-        /// 共用的同一个入口），验「标题进输入态 → 回车落名 → 标题回到纯文字态」。
-        /// 双击手势本身在自检里造不出来，识别逻辑靠人工验收。
+        /// 改名链路自检：完整模拟一次双击的事件流（down → up → down(ClickCount=2) → up），
+        /// 事件从 header 一路冒泡到窗口，和真鼠标走的是同一条路由。
+        /// 验「候选记账 → 双击识别 → 输入框出现在活 header 上 → 回车落名」整条链。
         /// </summary>
         private async void RunRenameTest(string path)
         {
@@ -1531,34 +1531,47 @@ namespace TileBoard
                 else
                 {
                     lines.Add("目标分组 = " + group.Name);
-                    var header = FindGroupHeader(group);
-                    lines.Add("标题元素 = " + (header != null ? "找到 ✔" : "缺失 ✘"));
 
-                    if (header != null)
+                    // ---- 第一次按下：候选建立 ----
+                    var header1 = FindGroupHeader(group);
+                    lines.Add("标题元素 = " + (header1 != null ? "找到 ✔" : "缺失 ✘"));
+                    header1?.RaiseEvent(ClickArgs(UIElement.MouseLeftButtonDownEvent, 1));
+                    lines.Add("down1 候选 = " + (_groupMouseDown ? "已建立 ✔" : "没建立 ✘"));
+
+                    // ---- 第一次抬起：记账，板面会重建 ----
+                    header1?.RaiseEvent(ClickArgs(UIElement.MouseLeftButtonUpEvent, 1));
+                    lines.Add("up1 记账   = " +
+                              (ReferenceEquals(_lastHeaderClickGroup, group) ? "✔" : "✘ 记到了别的组"));
+
+                    await Task.Delay(120);   // 间隔压在系统双击时限之内
+
+                    // ---- 第二次按下（ClickCount=2）：应进改名分支 ----
+                    var header2 = FindGroupHeader(group);
+                    header2?.RaiseEvent(ClickArgs(UIElement.MouseLeftButtonDownEvent, 2));
+                    lines.Add("down2 输入框 = " +
+                              (FindGroupHeader(group)?.Child is TextBox ? "已出现 ✔" : "没出现 ✘"));
+
+                    // ---- 回车落名 ----
+                    var box = (FindGroupHeader(group)?.Child as TextBox);
+                    if (box != null)
                     {
-                        BeginRenameGroup(group);
-                        lines.Add("输入框   = " + (header.Child is TextBox ? "已出现 ✔" : "没出现 ✘"));
-
-                        if (header.Child is TextBox box)
+                        box.Text = "自检改名";
+                        var source = PresentationSource.FromVisual(box);
+                        if (source == null)
                         {
-                            box.Text = "自检改名";
-                            var source = PresentationSource.FromVisual(box);
-                            if (source == null)
-                            {
-                                lines.Add("回车落名 = SKIP 拿不到 PresentationSource");
-                            }
-                            else
-                            {
-                                box.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, Key.Enter)
-                                { RoutedEvent = Keyboard.KeyDownEvent });
-                                lines.Add($"回车落名 = 「{group.Name}」  " +
-                                          (group.Name == "自检改名" ? "✔" : "✘"));
-                                var rebuilt = FindGroupHeader(group);
-                                lines.Add("标题重建 = " +
-                                          (rebuilt != null && rebuilt.Child is Grid
-                                              ? "✔ 回到纯文字态"
-                                              : "✘ 还是输入框"));
-                            }
+                            lines.Add("回车落名 = SKIP 拿不到 PresentationSource");
+                        }
+                        else
+                        {
+                            box.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, Key.Enter)
+                            { RoutedEvent = Keyboard.KeyDownEvent });
+                            lines.Add($"回车落名 = 「{group.Name}」  " +
+                                      (group.Name == "自检改名" ? "✔" : "✘"));
+                            var rebuilt = FindGroupHeader(group);
+                            lines.Add("标题重建 = " +
+                                      (rebuilt != null && rebuilt.Child is Grid
+                                          ? "✔ 回到纯文字态"
+                                          : "✘ 还是输入框"));
                         }
                     }
                 }
@@ -1573,6 +1586,22 @@ namespace TileBoard
 
             System.IO.File.WriteAllLines(path, lines);
             Application.Current.Shutdown();
+        }
+
+        /// <summary>造一个可冒泡的鼠标左键事件，自检里当真点击用。</summary>
+        private static MouseButtonEventArgs ClickArgs(RoutedEvent evt, int clickCount)
+        {
+            var args = new MouseButtonEventArgs(Mouse.PrimaryDevice, Environment.TickCount, MouseButton.Left)
+            {
+                RoutedEvent = evt
+            };
+
+            // ClickCount 的 setter 不公开，反射写 —— 自检要模拟「第二次按下」就绕不开它
+            typeof(MouseButtonEventArgs)
+                .GetProperty(nameof(MouseButtonEventArgs.ClickCount))!
+                .SetValue(args, clickCount);
+
+            return args;
         }
 
         /// <summary>
@@ -3528,8 +3557,12 @@ namespace TileBoard
             {
                 if (e.ClickCount == 2)
                 {
+                    // 先清候选再进改名，顺序不能反：CancelGroupDrag 会重建板面，
+                    // 闭包里这个 header 十有八九已经被拆出视觉树 —— 直接把输入框
+                    // 加上去就是加给一个看不见的元素，表现成「双击没反应」。
+                    // BeginRenameGroup 会现找「现在还挂在树上」的那个 header。
                     CancelGroupDrag();
-                    BeginRename(group, header, title);
+                    BeginRenameGroup(group);
                     e.Handled = true;
                     return;
                 }
