@@ -4746,6 +4746,8 @@ namespace TileBoard
             open.Click += (s, e) => Launch(tile.Aumid);
             menu.Items.Add(open);
 
+            menu.Items.Add(new Separator());
+
             // Win10 原版布局：四档尺寸收进「调整大小」子菜单，子项可勾选
             var resize = new MenuItem { Header = "调整大小", Icon = MenuIcon("\uE8FD") };
             foreach (TileSize size in Enum.GetValues(typeof(TileSize)))
@@ -4802,26 +4804,31 @@ namespace TileBoard
                 }
             };
             moveMenu.Items.Add(newGroupItem);
-            menu.Items.Add(moveMenu);
 
-            menu.Items.Add(new Separator());
-
-            // Win10 同款应用级动作区：文件位置 / 任务栏 / 管理员 / 卸载
-            var openLocation = new MenuItem { Header = "打开文件位置", Icon = MenuIcon("\uE8B7") };
-            openLocation.Click += (s, e) => OpenFileLocationFor(tile);
-            menu.Items.Add(openLocation);
+            // Win10 原版布局：三个应用级动作收进「更多」子菜单（顺序同 Win10：
+            // 固定到任务栏 → 以管理员身份运行 → 打开文件位置），卸载独占一级项
+            var moreMenu = new MenuItem { Header = "更多", Icon = MenuIcon("\uE712") };
 
             var pinTaskbar = new MenuItem { Header = "添加到任务栏", Icon = MenuIcon("\uE718") };
             pinTaskbar.Click += (s, e) => PinToTaskbarFor(tile);
-            menu.Items.Add(pinTaskbar);
+            moreMenu.Items.Add(pinTaskbar);
 
             var runAdmin = new MenuItem { Header = "管理员身份打开", Icon = MenuIcon("\uE7EF") };
             runAdmin.Click += (s, e) => RunAsAdminFor(tile);
-            menu.Items.Add(runAdmin);
+            moreMenu.Items.Add(runAdmin);
+
+            var openLocation = new MenuItem { Header = "打开文件位置", Icon = MenuIcon("\uE8B7") };
+            openLocation.Click += (s, e) => OpenFileLocationFor(tile);
+            moreMenu.Items.Add(openLocation);
+
+            menu.Items.Add(moreMenu);
 
             var uninstall = new MenuItem { Header = "卸载", Icon = MenuIcon("\uE74D") };
             uninstall.Click += (s, e) => UninstallFor(tile);
             menu.Items.Add(uninstall);
+
+            menu.Items.Add(new Separator());
+            menu.Items.Add(moveMenu);
 
             menu.Items.Add(new Separator());
 
@@ -4829,7 +4836,7 @@ namespace TileBoard
             appearanceItem.Click += (s, e) => ShowSettingsPage();
             menu.Items.Add(appearanceItem);
 
-            var remove = new MenuItem { Header = "从磁贴板移除", Icon = MenuIcon("\uE74D") };
+            var remove = new MenuItem { Header = "从磁贴板移除", Icon = MenuIcon("\uE77A") };
             remove.Click += (s, e) =>
             {
                 group?.Tiles.Remove(tile);
