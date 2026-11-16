@@ -5732,14 +5732,28 @@ namespace TileBoard
             var row = RowFromEvent(e);
             if (row == null) return;
 
-            var menu = MakeMenu();
-
-            menu.Items.Add(MakePowerItem("打开", () => { Launch(row.Aumid); HideBoard(); }, "\uE768"));
-            menu.Items.Add(MakePowerItem(row.IsPinned ? "已经在磁贴板上" : "固定到磁贴板", () =>
+            // 应用库右键 = 磁贴右键同一套菜单。在板上的直接用板上那块（连分组一起）；
+            // 没上板的临时造一块 —— 这样「调整大小/移到分组」对新应用也成立，
+            // 移进某个分组就等于把它固定上板。
+            TileItem tile = null;
+            TileGroup group = null;
+            if (_layout?.Groups != null)
             {
-                PinAumid(row.Aumid);
-                FillLibrary(SearchBox.Text);
-            }, row.IsPinned ? null : "\uE718"));
+                foreach (var g in _layout.Groups)
+                {
+                    var hit = g?.Tiles.FirstOrDefault(t => t != null &&
+                        string.Equals(t.Aumid, row.Aumid, StringComparison.OrdinalIgnoreCase));
+                    if (hit == null) continue;
+                    tile = hit;
+                    group = g;
+                    break;
+                }
+            }
+
+            if (tile == null)
+                tile = new TileItem { Aumid = row.Aumid, Name = row.Name, Size = TileSize.Medium };
+
+            var menu = BuildTileMenu(tile, group);
 
             menu.PlacementTarget = AppsList;
             menu.Placement = PlacementMode.MousePoint;
