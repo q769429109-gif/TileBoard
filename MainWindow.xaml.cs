@@ -100,6 +100,13 @@ namespace TileBoard
         /// </summary>
         private Dictionary<TileItem, (int Column, int Row)> _dragSnapshot;
 
+        /// <summary>
+        /// 磁贴拖动开始那一刻，全场分组的格位。磁贴被拖进某个组会把组撑大，
+        /// RenderAll 里的 Normalize 见到重叠就把邻组推走 —— 这笔账每步都得退回去，
+        /// 不然磁贴拖一圈，板上的分组就被顶得七零八落回不了家。
+        /// </summary>
+        private Dictionary<TileGroup, (int Column, int Row)> _dragGroupSnapshot;
+
         // 应用库列表里的拖动判据：先记按下的是哪一行，动过 6px 才算拖
         private AppRow _listDragRow;
         private Point _listDragOrigin;
@@ -1328,6 +1335,46 @@ namespace TileBoard
                         var rightPt = new Point(cr + 12, cy + GroupGrid.HeaderHeight + 20);
                         bool rightHit = TryResolveDrop(rightPt, out TileGroup rg, out _, out _);
                         lines.Add($"右边外 12px = {(rightHit ? "吸进 " + rg?.Name + " ✔" : "落空 ✘")}");
+                    }
+
+                    // ---- 分组坐标复原：磁贴跨组悬停一圈再回家，分组必须全体归位 ----
+                    // 磁贴进组会把组撑大，RenderAll 里的 Normalize 会趁机推邻组；
+                    // 没有分组快照的话，被推的组就永远留在被顶走的地方
+                    var home = _layout.Groups.FirstOrDefault(g => !g.Collapsed && g.Tiles.Count >= 2);
+                    var other = _layout.Groups.FirstOrDefault(g => g != home && !g.Collapsed && g.Tiles.Count > 0);
+                    if (home != null && other != null)
+                    {
+                        var tile = home.Tiles[0];
+                        var homeBorder = FindTileBorder(tile);
+                        var otherBorder = FindTileBorder(other.Tiles[0]);
+                        if (homeBorder != null && otherBorder != null)
+                        {
+                            lines.Add("");
+                            lines.Add("==== 分组坐标复原 ====");
+                            var beforePos = _layout.Groups.ToDictionary(g => g, g => (g.Column, g.Row));
+
+                            _dragItem = tile;
+                            _dragGroup = home;
+                            _dragBorder = homeBorder;
+                            _mouseDown = true;
+                            StartDrag(homeBorder.TranslatePoint(new Point(20, 20), this));
+
+                            // 跨组悬停：目标组被撑大，Normalize 见重叠就推邻组
+                            Point ot = otherBorder.TranslatePoint(new Point(0, 0), this);
+                            UpdateDrag(new Point(ot.X + _grabOffset.X, ot.Y + _grabOffset.Y));
+
+                            // 悬停回家，松手 —— 一圈下来板面不该留下任何位移
+                            Point ht = homeBorder.TranslatePoint(new Point(20, 20), this);
+                            UpdateDrag(new Point(ht.X + _grabOffset.X, ht.Y + _grabOffset.Y));
+                            EndDrag();
+
+                            var wander = _layout.Groups
+                                .Where(g => beforePos.TryGetValue(g, out var c) &&
+                                            (g.Column != c.Column || g.Row != c.Row))
+                                .Select(g => g.Name).ToList();
+                            lines.Add("分组归位 = " + (wander.Count == 0 ? "全体复原 ✔" : "没回家 ✘ " + string.Join(", ", wander)));
+                            lines.Add("overlap  = " + (HasOverlap() ? "存在重叠 ✘" : "无重叠 ✔"));
+                        }
                     }
 
                     lines.Add("");
@@ -3948,11 +3995,18 @@ namespace TileBoard
         private void TakeDragSnapshot()
         {
             _dragSnapshot = new Dictionary<TileItem, (int Column, int Row)>();
+            _dragGroupSnapshot = new Dictionary<TileGroup, (int Column, int Row)>();
 
             if (_layout?.Groups == null) return;
 
             foreach (var g in _layout.Groups)
             {
+                if (g == null) continue;
+
+                // 分组的格位单独记一笔：磁贴进出组会让组长大缩小，
+                // Normalize 趁机推走的邻组全靠这份快照送回原位
+                _dragGroupSnapshot[g] = (g.Column, g.Row);
+
                 if (g?.Tiles == null) continue;
                 foreach (var t in g.Tiles)
                     if (t != null) _dragSnapshot[t] = (t.Column, t.Row);
@@ -3979,6 +4033,21 @@ namespace TileBoard
             }
         }
 
+        /// <summary>把全场分组的格位退回磁贴拖动开始时的样子。</summary>
+        private void RestoreDragGroupsSnapshot()
+        {
+            if (_dragGroupSnapshot == null || _layout?.Groups == null) return;
+
+            foreach (var g in _layout.Groups)
+            {
+                if (g != null && _dragGroupSnapshot.TryGetValue(g, out var home))
+                {
+                    g.Column = home.Column;
+                    g.Row = home.Row;
+                }
+            }
+        }
+
         private void UpdateDrag(Point p)
         {
             if (_ghost == null || _dragItem == null) return;
@@ -3989,6 +4058,10 @@ namespace TileBoard
             // 每次移动都先归位再重算。放在落点判定之前，因为 Place 判断「交换回原位」
             // 时读的就是各磁贴当前的坐标。
             RestoreDragSnapshot();
+
+            // 分组格位同样先退回起点：上一步跨组时 Normalize 可能已经把邻组推走了，
+            // 不退回去的话被推的组就一路顶着走，拖完一圈回不了家
+            RestoreDragGroupsSnapshot();
 
             // 指针还压在应用库上：不算落点。
             // 面板宽 336 盖着板面左侧，底下那几个分组是看不见的 —— 在这里解析落点
@@ -4060,6 +4133,12 @@ namespace TileBoard
             _dropIntoNewGroup = false;
             _dragIsNew = false;
             _dragSnapshot = null;
+
+            // 拖动途中被 Normalize 顶走的分组先全体回家；之后的落定
+            // （CommitNewGroup / RenderAll 里的 Normalize）按「最终」的磁贴布局
+            // 收一次账 —— 该让位的让位，且只让这一次
+            RestoreDragGroupsSnapshot();
+            _dragGroupSnapshot = null;
 
             if (newGroup && item != null)
             {
@@ -5494,6 +5573,10 @@ namespace TileBoard
             SetRailActive(BtnLibrary, true);
 
             Mouse.Capture(this, CaptureMode.Element);
+
+            // 新磁贴也要有快照：拖进组里照样会把组撑大、把邻组推走
+            TakeDragSnapshot();
+
             UpdateDrag(p);
         }
 
@@ -5504,6 +5587,12 @@ namespace TileBoard
             _mouseDown = false;
             _dragIsNew = false;
             _dropIntoNewGroup = false;
+
+            // 新磁贴没落下去：被拖动途中顶走的分组送回原位
+            RestoreDragGroupsSnapshot();
+            _dragGroupSnapshot = null;
+            _dragSnapshot = null;
+            RenderAll();
 
             if (_ghost != null)
             {
