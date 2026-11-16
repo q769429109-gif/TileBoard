@@ -549,6 +549,53 @@ namespace TileBoard.Native
             return hitResult;
         }
 
+        /// <summary>
+        /// 诊断用：扫开始菜单（两层根 + 逐层容错）列出所有带 AUMID 的快捷方式。
+        /// 配合 --findlnk 排「为什么我的应用匹配不上」。
+        /// </summary>
+        public static List<(string LnkPath, string Aumid)> DiagListShortcuts()
+        {
+            var result = new List<(string, string)>();
+            var roots = new List<string>
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.StartMenu),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu)
+            };
+
+            foreach (var rootPath in roots)
+            {
+                if (string.IsNullOrEmpty(rootPath) || !System.IO.Directory.Exists(rootPath)) continue;
+
+                var pending = new Queue<string>();
+                pending.Enqueue(rootPath);
+
+                while (pending.Count > 0)
+                {
+                    string dir = pending.Dequeue();
+
+                    string[] lnks = null;
+                    try { lnks = System.IO.Directory.GetFiles(dir, "*.lnk"); }
+                    catch { /* 不可读，跳过 */ }
+
+                    if (lnks != null)
+                        foreach (var lnk in lnks)
+                        {
+                            string id = ReadShortcutAumid(lnk);
+                            if (!string.IsNullOrEmpty(id))
+                                result.Add((lnk, id));
+                        }
+
+                    try
+                    {
+                        foreach (var sub in System.IO.Directory.EnumerateDirectories(dir))
+                            pending.Enqueue(sub);
+                    }
+                    catch { /* 跳过整层 */ }
+                }
+            }
+            return result;
+        }
+
         /// <summary>读 .lnk 的 System.AppUserModel.ID 属性（快捷方式拿到的固定资格证）。</summary>
         private static string ReadShortcutAumid(string lnkPath)
         {
@@ -612,6 +659,33 @@ namespace TileBoard.Native
         }
 
         // ===================== 打开文件位置 =====================
+
+        [DllImport("shell32.dll")]
+        private static extern int SHGetKnownFolderPath(ref Guid folderId, uint flags, IntPtr token, out IntPtr path);
+
+        /// <summary>
+        /// 「{已知文件夹 GUID}\相对路径」→ 真实文件系统路径。
+        /// 磁贴 AUMID 里常见这种虚拟路径（{7C5A40EF-…}\Netease\xxx.exe 就是
+        /// ProgramFilesX86 下某文件），explorer /select 认不了，必须先换算。
+        /// 不是 GUID 形式返回 null。
+        /// </summary>
+        public static string ExpandKnownFolderPath(string parsing)
+        {
+            if (string.IsNullOrEmpty(parsing) || parsing[0] != '{') return null;
+            int close = parsing.IndexOf('}');
+            if (close <= 0 || close >= parsing.Length - 1 || parsing[close + 1] != '\\') return null;
+            if (!Guid.TryParse(parsing.Substring(0, close + 1), out Guid folderId)) return null;
+
+            try
+            {
+                int hr = SHGetKnownFolderPath(ref folderId, 0, IntPtr.Zero, out IntPtr ptr);
+                if (hr != 0 || ptr == IntPtr.Zero) return null;
+                string root = Marshal.PtrToStringUni(ptr);
+                Marshal.FreeCoTaskMem(ptr);
+                return root == null ? null : System.IO.Path.Combine(root, parsing.Substring(close + 2));
+            }
+            catch { return null; }
+        }
 
         /// <summary>在资源管理器里定位到某个文件（选中高亮）。</summary>
         public static void RevealInExplorer(string filePath)

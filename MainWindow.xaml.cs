@@ -1059,6 +1059,15 @@ namespace TileBoard
             string dumpPath = GetArg("--layoutdump");
             if (dumpPath != null) { DumpLayout(dumpPath); return; }
 
+            // 调试/验收用：--findlnk <aumid> <txt> 摊开「打开文件位置」的查找链
+            string findLnkAumid = GetArg("--findlnk");
+            if (findLnkAumid != null)
+            {
+                string findLnkOut = GetArg("--out") ?? "findlnk.txt";
+                RunFindLnkTest(findLnkAumid, findLnkOut);
+                return;
+            }
+
             // 调试/验收用：--grouptest <txt> 跑一遍「抓起分组→吸附格位→挤开邻居」
             string groupTestPath = GetArg("--grouptest");
             if (groupTestPath != null) { RunGroupTest(groupTestPath); return; }
@@ -1231,6 +1240,49 @@ namespace TileBoard
                 if (string.Equals(args[i], name, StringComparison.OrdinalIgnoreCase))
                     return args[i + 1];
             return null;
+        }
+
+        /// <summary>
+        /// 「打开文件位置」查找链诊断：把每一步的结果摊开——
+        /// AUMID 类型判断、.lnk 扫描结果、目标 exe、shell 动词表、
+        /// 以及开始菜单里实际注册了哪些 AUMID（找不匹配的病根用）。
+        /// </summary>
+        private void RunFindLnkTest(string aumid, string path)
+        {
+            var lines = new List<string>();
+            try
+            {
+                lines.Add("AUMID = " + aumid);
+                lines.Add("LooksLikePath = " + Native.NativeShell.LooksLikePath(aumid));
+                int bang = aumid?.IndexOf('!') ?? -1;
+                lines.Add("含'!'(UWP) = " + (bang > 0));
+
+                var (lnk, target) = Native.ShellActions.FindShortcutByAumid(aumid);
+                lines.Add("开始菜单 .lnk = " + (lnk ?? "(没找到)"));
+                lines.Add("目标 exe = " + (target ?? "(lnk 没解析出目标)"));
+                if (lnk != null)
+                    lines.Add("lnk 存在 = " + System.IO.File.Exists(lnk) +
+                              "  target 存在 = " + (target == null ? "-" : System.IO.File.Exists(target).ToString()));
+
+                lines.Add("--- shell 动词表 (shell:AppsFolder\\AUMID) ---");
+                foreach (var (verb, text) in Native.ShellActions.GetVerbs("shell:AppsFolder\\" + aumid))
+                    lines.Add($"  [{(verb ?? "(空)")}] {text}");
+
+                lines.Add("--- 开始菜单里带 AUMID 的快捷方式（前 120 条）---");
+                int shown = 0;
+                foreach (var (lnkPath, id) in Native.ShellActions.DiagListShortcuts())
+                {
+                    if (++shown > 120) { lines.Add("  ...(更多略)"); break; }
+                    lines.Add($"  {id}  <=  {lnkPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                lines.Add("EX " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            System.IO.File.WriteAllLines(path, lines);
+            Application.Current.Shutdown();
         }
 
         /// <summary>
@@ -4875,19 +4927,34 @@ namespace TileBoard
 
         /// <summary>
         /// 打开文件位置 = 资源管理器定位到「文件属性里显示的那个地址」并选中：
-        /// 桌面路径 → 直接定位；UWP → 包安装目录（WindowsApps 下真实所在）；
-        /// Win32 → 开始菜单 .lnk 解析出目标 exe，定位 exe 本身（属性「目标」那个路径）。
-        /// shell 的 opencontaining 只做最后兜底（它对不少 AUMID 会失败）。
+        /// {已知文件夹 GUID}\… → 换算真实路径；桌面路径 → 直接定位；
+        /// 其余（QQ/MSEdge/Discord/Chrome 等 AUMID）→ 系统原生「打开文件位置」
+        /// 动词打头 —— AppsFolder 项的目标在哪系统自己最清楚，
+        /// 自己扫 .lnk 既慢又会被无权限目录卡脖子，只配当兜底。
         /// </summary>
         private void OpenFileLocationFor(TileItem tile)
         {
             try
             {
+                // {已知文件夹 GUID}\… 虚拟路径先换算成真实路径
+                string expanded = Native.ShellActions.ExpandKnownFolderPath(tile.Aumid);
+                if (expanded != null)
+                {
+                    Native.ShellActions.RevealInExplorer(expanded);
+                    return;
+                }
+
                 if (Native.NativeShell.LooksLikePath(tile.Aumid))
                 {
                     Native.ShellActions.RevealInExplorer(tile.Aumid);
                     return;
                 }
+
+                // 系统原生「打开文件位置」规范动词（诊断实锤：QQ/MSEdge/
+                // Discord/Chrome 的 AppsFolder 项全都带这个动词）
+                if (Native.ShellActions.InvokeItemVerb(
+                        AppsItemParsing(tile), "OpenFileLocation"))
+                    return;
 
                 // packaged 应用：包安装目录就是它的「文件属性地址」
                 int bang = tile.Aumid?.IndexOf('!') ?? -1;
@@ -4915,7 +4982,7 @@ namespace TileBoard
                     return;
                 }
 
-                // 全没解析出来：shell 自己的「打开文件位置」动词兜底（已静默失败）
+                // 老系统动词兜底
                 if (Native.ShellActions.InvokeItemVerb(
                         AppsItemParsing(tile), "opencontaining"))
                     return;
