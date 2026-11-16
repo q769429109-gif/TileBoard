@@ -301,7 +301,7 @@
              就是「一片糊，几乎读不出来」。所以模板必须整套换掉，不能只改颜色。
 
              结构照 Win10 磁贴右键菜单（主人给的截图）：
-             左边 34px 图标列放 16px 线性图标，右边是子菜单箭头，行高 32，
+             左边 44px 图标列放 16px 线性图标，右边是子菜单箭头，行高 32，
              悬停高亮用强调蓝 —— 开始菜单的磁贴菜单悬停就是这一条蓝。
         -->
         <Style TargetType="MenuItem">
@@ -316,14 +316,14 @@
                                 TextElement.Foreground="{TemplateBinding Foreground}">
                             <Grid>
                                 <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="34"/>
+                                    <ColumnDefinition Width="44"/>
                                     <ColumnDefinition Width="*"/>
                                     <ColumnDefinition Width="Auto"/>
                                 </Grid.ColumnDefinitions>
 
                                 <!-- 图标列：菜单项自带的 Icon（MDL2 线性图标），Win10 同位置 -->
                                 <ContentPresenter Grid.Column="0" ContentSource="Icon"
-                                                  Width="34" VerticalAlignment="Center"
+                                                  Width="44" VerticalAlignment="Center"
                                                   HorizontalAlignment="Center"
                                                   TextElement.Foreground="#CCCCCC"/>
 
