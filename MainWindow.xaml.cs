@@ -1068,6 +1068,10 @@ namespace TileBoard
                 return;
             }
 
+            // 调试/验收用：--icontest2 <txt> 全量探测板上磁贴的图标链路
+            string iconTest2Path = GetArg("--icontest2");
+            if (iconTest2Path != null) { RunIconTest2(iconTest2Path); return; }
+
             // 调试/验收用：--grouptest <txt> 跑一遍「抓起分组→吸附格位→挤开邻居」
             string groupTestPath = GetArg("--grouptest");
             if (groupTestPath != null) { RunGroupTest(groupTestPath); return; }
@@ -1243,6 +1247,57 @@ namespace TileBoard
         }
 
         /// <summary>
+        /// 图标链路全量探测：板上每块磁贴，应用库请求尺寸（32）与磁贴请求尺寸（256）
+        /// 各取一次，报告「是否取到、位图实际像素」。库缺图标 / 磁贴图标过小
+        /// 都能从这里直接看出病根。
+        /// </summary>
+        private void RunIconTest2(string path)
+        {
+            var lines = new List<string>();
+            try
+            {
+                var aumids = _layout?.Groups?
+                    .SelectMany(g => g.Tiles ?? new System.Collections.Generic.List<TileItem>())
+                    .Where(t => t != null && !string.IsNullOrEmpty(t.Aumid))
+                    .Select(t => (t.Aumid, t.Name))
+                    .Distinct()
+                    .ToList() ?? new List<(string, string)>();
+
+                lines.Add("磁贴应用数 = " + aumids.Count);
+
+                foreach (var (aumid, name) in aumids)
+                {
+                    var s32 = _catalog.GetIcon(aumid, 32);
+                    var s256 = _catalog.GetIcon(aumid, 256);
+
+                    string fmt(BitmapSource b) => b == null
+                        ? "null"
+                        : $"{b.PixelWidth}x{b.PixelHeight}";
+
+                    string err = s256 == null
+                        ? "  err=" + (Native.NativeShell.GetAppImageHandle(aumid, 256) != IntPtr.Zero
+                            ? "(重试成功?)"
+                            : Native.NativeShell.LastError)
+                          + (aumid.Contains("!")
+                              ? "  pkg=" + Native.ShellActions.GetPackagedAppIcon(aumid, 256) + " / " +
+                                Native.ShellActions.PackagedIconDiag
+                              : "")
+                        : "";
+
+                    lines.Add($"{(s32 == null ? "缺32" : "  32")}  {(s256 == null ? "缺256" : " 256")}  " +
+                              $"32={fmt(s32)}  256={fmt(s256)}{err}  {name}  [{aumid}]");
+                }
+            }
+            catch (Exception ex)
+            {
+                lines.Add("EX " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            System.IO.File.WriteAllLines(path, lines);
+            Application.Current.Shutdown();
+        }
+
+        /// <summary>
         /// 「打开文件位置」查找链诊断：把每一步的结果摊开——
         /// AUMID 类型判断、.lnk 扫描结果、目标 exe、shell 动词表、
         /// 以及开始菜单里实际注册了哪些 AUMID（找不匹配的病根用）。
@@ -1274,6 +1329,21 @@ namespace TileBoard
                 {
                     if (++shown > 120) { lines.Add("  ...(更多略)"); break; }
                     lines.Add($"  {id}  <=  {lnkPath}");
+                }
+
+                // 抽三个真实 .lnk 逐步骤探：找「读属性为什么全空」的病根
+                lines.Add("--- 抽样 .lnk 步骤诊断 ---");
+                foreach (var probe in new[]
+                {
+                    @"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Excel.lnk",
+                    @"C:\Users\star\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Discord.lnk",
+                    @"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Word.lnk"
+                })
+                {
+                    lines.Add("  " + probe + "  =>  " +
+                              (System.IO.File.Exists(probe)
+                                  ? Native.ShellActions.DiagProbeLnk(probe)
+                                  : "(文件不存在)"));
                 }
             }
             catch (Exception ex)

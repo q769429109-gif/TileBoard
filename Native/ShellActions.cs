@@ -1,7 +1,14 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Windows;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Imaging;
+using System.Xml.Linq;
 
 namespace TileBoard.Native
 {
@@ -277,6 +284,8 @@ namespace TileBoard.Native
 
         private static readonly PROPERTYKEY PKEY_AppUserModel_ID = new PROPERTYKEY
         {
+            // System.AppUserModel.ID —— propkey.h 原值（微软文档实锤：
+            // formatID 9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3, propID 5）
             fmtid = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"),
             pid = 5
         };
@@ -597,6 +606,134 @@ namespace TileBoard.Native
         }
 
         /// <summary>读 .lnk 的 System.AppUserModel.ID 属性（快捷方式拿到的固定资格证）。</summary>
+        /// <summary>
+        /// 按应用名在开始菜单找同名 .lnk 并解析目标 exe。
+        /// 这台机器上 .lnk 普遍不存 AppUserModel.ID 属性（GetValue 返回 VT_EMPTY，
+        /// Office C2R / 新版 Discord 都靠运行时注册身份），按 AUMID 匹配是死路，
+        /// 按名字匹配是唯一活路。精确名优先，其次前缀/包含。结果按名缓存。
+        /// </summary>
+        public static string FindShortcutTargetByName(string appName)
+        {
+            if (string.IsNullOrWhiteSpace(appName)) return null;
+
+            lock (_targetByNameCache)
+            {
+                if (_targetByNameCache.TryGetValue(appName, out var hit)) return hit;
+            }
+
+            string best = null;
+            int bestScore = int.MaxValue;
+
+            var roots = new List<string>
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.StartMenu),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu)
+            };
+
+            foreach (var root in roots)
+            {
+                if (string.IsNullOrEmpty(root) || !System.IO.Directory.Exists(root)) continue;
+
+                var pending = new Queue<string>();
+                pending.Enqueue(root);
+
+                while (pending.Count > 0)
+                {
+                    string dir = pending.Dequeue();
+
+                    string[] lnks = null;
+                    try { lnks = System.IO.Directory.GetFiles(dir, "*.lnk"); }
+                    catch { /* 不可读，跳过 */ }
+
+                    if (lnks != null)
+                        foreach (var lnk in lnks)
+                        {
+                            string stem = System.IO.Path.GetFileNameWithoutExtension(lnk);
+                            int score;
+                            if (string.Equals(stem, appName, StringComparison.OrdinalIgnoreCase))
+                                score = 0;
+                            else if (stem.StartsWith(appName, StringComparison.OrdinalIgnoreCase))
+                                score = 1;
+                            else if (stem.Contains(appName) ||
+                                     appName.IndexOf(stem, StringComparison.OrdinalIgnoreCase) >= 0)
+                                score = 2;
+                            else continue;
+
+                            if (score >= bestScore) continue;
+
+                            string target = ReadShortcutTarget(lnk);
+                            if (string.IsNullOrEmpty(target) || !System.IO.File.Exists(target)) continue;
+
+                            best = target;
+                            bestScore = score;
+                        }
+
+                    try
+                    {
+                        foreach (var sub in System.IO.Directory.EnumerateDirectories(dir))
+                            pending.Enqueue(sub);
+                    }
+                    catch { /* 跳过整层 */ }
+                }
+            }
+
+            lock (_targetByNameCache) _targetByNameCache[appName] = best;
+            return best;
+        }
+
+        private static readonly Dictionary<string, string> _targetByNameCache =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>诊断：对单个 .lnk 逐步骤读 AUMID/目标，异常全程不吞。</summary>
+        public static string DiagProbeLnk(string lnkPath)
+        {
+            var steps = new List<string>();
+            object linkObj = null;
+            try
+            {
+                Guid clsid = CLSID_ShellLink, iid = IID_IShellLinkW;
+                CoCreateInstance(ref clsid, IntPtr.Zero, 1, ref iid, out linkObj);
+                steps.Add("CoCreate ✔");
+
+                var persist = (System.Runtime.InteropServices.ComTypes.IPersistFile)linkObj;
+                persist.Load(lnkPath, 0x00000020);
+                steps.Add("Load ✔");
+
+                var link = (IShellLinkW)linkObj;
+                var sb = new StringBuilder(260);
+                link.GetPath(sb, 260, out _, 0);
+                steps.Add("target=" + (sb.Length > 0 ? sb.ToString() : "(空)"));
+
+                try
+                {
+                    var store = (IPropertyStore)linkObj;
+                    steps.Add("QI IPropertyStore ✔");
+                    var key = PKEY_AppUserModel_ID;
+                    store.GetValue(ref key, out PROPVARIANT pv);
+                    steps.Add($"GetValue ✔ vt={pv.vt} ptr={pv.pwszVal}");
+                    string id = pv.vt == 31 && pv.pwszVal != IntPtr.Zero
+                        ? Marshal.PtrToStringUni(pv.pwszVal)
+                        : null;
+                    steps.Add("aumid=" + (id ?? "(null)"));
+                    if (pv.vt == 31 && pv.pwszVal != IntPtr.Zero) CoTaskMemFree(pv.pwszVal);
+                }
+                catch (Exception ex)
+                {
+                    steps.Add("属性段 EX " + ex.GetType().Name + ": " + ex.Message);
+                }
+
+                return string.Join("; ", steps);
+            }
+            catch (Exception ex)
+            {
+                return string.Join("; ", steps) + "; EX " + ex.GetType().Name + ": " + ex.Message;
+            }
+            finally
+            {
+                if (linkObj != null) Marshal.ReleaseComObject(linkObj);
+            }
+        }
+
         private static string ReadShortcutAumid(string lnkPath)
         {
             object linkObj = null;
@@ -752,9 +889,188 @@ namespace TileBoard.Native
             }
         }
 
-        // ===================== 卸载：注册表反查 =====================
+        // ===================== packaged 应用图标（UWP / 桌面桥） =====================
+        //
+        // IShellItemImageFactory 对一批桌面桥应用（Office C2R / 老 Edge / Skype）
+        // 出不了图：ICONONLY 与缩略图两条路都 0x80070002 —— shell 自己解析不到
+        // logo 资产。这里的绕法是直接进包里取：
+        //   family → 包目录（kernel32 AppModel API）→ AppxManifest.xml
+        //   → <Application Id> → Executable 提 icon（质量最好）→ manifest logo PNG 兜底
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SHDefExtractIcon(string path, int iconIndex, uint flags,
+            out IntPtr hLarge, out IntPtr hSmall, uint size);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct ICONINFO
+        {
+            public bool fIcon;
+            public int xHotspot, yHotspot;
+            public IntPtr hbmMask, hbmColor;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetIconInfo(IntPtr hIcon, out ICONINFO piconinfo);
+
+        [DllImport("user32.dll")]
+        private static extern bool DestroyIcon(IntPtr hIcon);
+
+        [DllImport("gdi32.dll")]
+        private static extern bool DeleteObject(IntPtr hObject);
+
+        /// <summary>GetPackagedAppIcon 每一步的记录（诊断用）。</summary>
+        public static string PackagedIconDiag { get; private set; }
 
         /// <summary>
+        /// 从 packaged 应用（AUMID 带 '!'）的包体里提取图标位图。
+        /// shell 的 IShellItemImageFactory 对这批应用失效，这是绕过实现。失败返回 null。
+        /// </summary>
+        public static BitmapSource GetPackagedAppIcon(string aumid, int pixels)
+        {
+            var log = new List<string>();
+            try
+            {
+                int bang = aumid?.IndexOf('!') ?? -1;
+                if (bang <= 0) { PackagedIconDiag = "AUMID 不带 '!'"; return null; }
+
+                string family = aumid.Substring(0, bang);
+                string appId = aumid.Substring(bang + 1);
+                log.Add("family=" + family + " appId=" + appId);
+
+                string pkgPath = GetPackageInstallPath(family);
+                if (pkgPath == null)
+                {
+                    // 机器级注册的收件箱包（老 Edge 这类）per-user API 查不到，
+                    // 但包体躺在 SystemApps\<family> 里，manifest 照样能读
+                    string sysApp = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                        "SystemApps", family);
+                    if (Directory.Exists(sysApp)) pkgPath = sysApp;
+                }
+                log.Add("pkgPath=" + (pkgPath ?? "(null)"));
+                if (pkgPath == null || !Directory.Exists(pkgPath)) { PackagedIconDiag = string.Join("; ", log); return null; }
+
+                string manifest = Path.Combine(pkgPath, "AppxManifest.xml");
+                log.Add("manifest 存在=" + File.Exists(manifest));
+                if (!File.Exists(manifest)) { PackagedIconDiag = string.Join("; ", log); return null; }
+
+                var doc = XDocument.Load(manifest);
+                XNamespace ns = doc.Root?.Name.Namespace ?? XNamespace.None;
+
+                var app = doc.Descendants(ns + "Application")
+                    .FirstOrDefault(a => (string)a.Attribute("Id") == appId);
+                log.Add("appId 命中=" + (app != null) +
+                        "  全部 Id=" + string.Join(",", doc.Descendants(ns + "Application")
+                            .Select(a => (string)a.Attribute("Id"))));
+                if (app == null) { PackagedIconDiag = string.Join("; ", log); return null; }
+
+                // 1) 从 manifest 声明的 exe 提 icon —— 请求 256 时 SHDefExtractIcon
+                //    会拿资源里最大的一档（PNG 压缩的 256px 条目），质量最好
+                string exe = (string)app.Attribute("Executable");
+                log.Add("exe=" + (exe ?? "(null)"));
+                if (!string.IsNullOrEmpty(exe))
+                {
+                    var bs = ExtractIconAsBitmap(Path.Combine(pkgPath, exe.Replace('/', '\\')), pixels);
+                    log.Add("exe 提图=" + (bs != null ? $"{bs.PixelWidth}x{bs.PixelHeight} ✔" : "null"));
+                    if (bs != null) { PackagedIconDiag = string.Join("; ", log); return bs; }
+                }
+
+                // 2) manifest 的 logo PNG（Square44x44 优先，按 scale/targetsize 变体挑尺寸）
+                var ve = app.Element(ns + "VisualElements");
+                string logo = ve?.Attribute("Square44x44Logo")?.Value
+                              ?? ve?.Attribute("Square150x150Logo")?.Value
+                              ?? ve?.Attribute("Logo")?.Value;
+                log.Add("logo=" + (logo ?? "(null)"));
+                if (!string.IsNullOrEmpty(logo))
+                {
+                    var bs = LoadLogoVariant(Path.Combine(pkgPath, logo.Replace('/', '\\')), pixels);
+                    log.Add("logo 提图=" + (bs != null ? $"{bs.PixelWidth}x{bs.PixelHeight} ✔" : "null"));
+                    if (bs != null) { PackagedIconDiag = string.Join("; ", log); return bs; }
+                }
+
+                PackagedIconDiag = string.Join("; ", log);
+                return null;
+            }
+            catch (Exception ex)
+            {
+                PackagedIconDiag = string.Join("; ", log) + "; EX " + ex.Message;
+                return null;
+            }
+        }
+
+        private static BitmapSource ExtractIconAsBitmap(string exePath, int pixels)
+        {
+            try
+            {
+                if (exePath == null || !File.Exists(exePath)) return null;
+
+                if (SHDefExtractIcon(exePath, 0, 0, out IntPtr hLarge, out IntPtr hSmall,
+                        (uint)pixels) != 0)
+                    return null;
+
+                IntPtr use = hLarge != IntPtr.Zero ? hLarge : hSmall;
+                if (use == IntPtr.Zero) return null;
+
+                try
+                {
+                    if (!GetIconInfo(use, out ICONINFO ii)) return null;
+                    try
+                    {
+                        if (ii.hbmColor == IntPtr.Zero) return null;
+                        var bs = Imaging.CreateBitmapSourceFromHBitmap(
+                            ii.hbmColor, IntPtr.Zero, Int32Rect.Empty,
+                            BitmapSizeOptions.FromEmptyOptions());
+                        bs.Freeze();
+                        return bs;
+                    }
+                    finally
+                    {
+                        if (ii.hbmMask != IntPtr.Zero) DeleteObject(ii.hbmMask);
+                        if (ii.hbmColor != IntPtr.Zero) DeleteObject(ii.hbmColor);
+                    }
+                }
+                finally
+                {
+                    DestroyIcon(use);
+                }
+            }
+            catch { return null; }
+        }
+
+        /// <summary>按 scale-N / targetsize-N 变体挑最接近请求尺寸且不超的 logo 文件。</summary>
+        private static BitmapSource LoadLogoVariant(string basePath, int pixels)
+        {
+            try
+            {
+                string dir = Path.GetDirectoryName(basePath);
+                string stem = Path.GetFileNameWithoutExtension(basePath);
+                if (dir == null || stem == null || !Directory.Exists(dir)) return null;
+
+                BitmapSource best = null;
+                int bestScore = int.MaxValue;
+
+                foreach (var f in Directory.GetFiles(dir, stem + "*"))
+                {
+                    try
+                    {
+                        BitmapSource frame;
+                        using (var fs = File.OpenRead(f))
+                            frame = BitmapFrame.Create(fs, BitmapCreateOptions.None,
+                                BitmapCacheOption.OnLoad);
+                        frame.Freeze();
+
+                        int big = Math.Max(frame.PixelWidth, frame.PixelHeight);
+                        int score = Math.Abs(big - pixels) + (big > pixels ? 10000 : 0);
+                        if (best == null || score < bestScore) { best = frame; bestScore = score; }
+                    }
+                    catch { /* 个别变体解不开，跳过 */ }
+                }
+                return best;
+            }
+            catch { return null; }
+        }
+
+        // ===================== 卸载：注册表反查 =====================        /// <summary>
         /// 按 exe 路径在卸载表里找它所属软件的卸载命令。
         /// 匹配优先级：DisplayIcon 完全一致 > InstallLocation 是 exe 的上级目录。
         /// </summary>

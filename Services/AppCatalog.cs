@@ -81,6 +81,27 @@ namespace TileBoard.Services
             try
             {
                 hbmp = NativeShell.GetAppImageHandle(aumid, pixels);
+
+                // shell 对一批桌面桥应用（Office C2R / 老 Edge / Skype）出不了图，
+                // 直接进包里从 manifest 声明的 exe / logo 提
+                if (hbmp == IntPtr.Zero && aumid.Contains('!'))
+                {
+                    var packaged = ShellActions.GetPackagedAppIcon(aumid, pixels);
+                    if (packaged != null)
+                    {
+                        lock (_iconLock) _iconCache[aumid + "|" + pixels] = packaged;
+                        return packaged;
+                    }
+                }
+
+                // Office C2R 这类 AUMID 的 AppsFolder 项 shell 解析不了资产，且
+                // .lnk 里也不存 AUMID 属性 —— 按名字找同名 lnk，对目标 exe 提 icon
+                if (hbmp == IntPtr.Zero)
+                {
+                    string target = ShellActions.FindShortcutTargetByName(ResolveName(aumid));
+                    if (target != null) hbmp = NativeShell.GetAppImageHandle(target, pixels);
+                }
+
                 if (hbmp != IntPtr.Zero)
                 {
                     result = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(

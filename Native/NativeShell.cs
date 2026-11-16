@@ -240,7 +240,15 @@ namespace TileBoard.Native
                     SHCreateItemFromParsingName(parsing, IntPtr.Zero, ref iid, out shItem);
                     obj = shItem;
                     var factory = (IShellItemImageFactory)shItem;
-                    factory.GetImage(new SIZE(pixels, pixels), SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, out hbmp);
+
+                    // 先只取图标。UWP 的 AppsFolder 项经常不走图标处理器
+                    // （SIIGBF_ICONONLY 直接 E_FAIL），这时去掉 ICONONLY 重试 ——
+                    // shell 会回退到应用 logo / 缩略图，照样能出 256px 的图
+                    factory.GetImage(new SIZE(pixels, pixels),
+                        SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, out hbmp);
+                    if (hbmp == IntPtr.Zero)
+                        factory.GetImage(new SIZE(pixels, pixels),
+                            SIIGBF_BIGGERSIZEOK, out hbmp);
                     if (hbmp != IntPtr.Zero) return hbmp;
                 }
                 catch (Exception ex)
