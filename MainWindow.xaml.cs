@@ -4742,12 +4742,18 @@ namespace TileBoard
             menu.Items.Add(new MenuItem { Header = tile.Name, IsEnabled = false });
             menu.Items.Add(new Separator());
 
+            var open = new MenuItem { Header = "打开", Icon = MenuIcon("\uE768") };
+            open.Click += (s, e) => Launch(tile.Aumid);
+            menu.Items.Add(open);
+
+            // Win10 原版布局：四档尺寸收进「调整大小」子菜单，子项可勾选
+            var resize = new MenuItem { Header = "调整大小", Icon = MenuIcon("\uE8FD") };
             foreach (TileSize size in Enum.GetValues(typeof(TileSize)))
             {
                 var sizeValue = size;
                 var mi = new MenuItem
                 {
-                    Header = $"{TileMetrics.Label(size)}磁贴",
+                    Header = TileMetrics.Label(sizeValue),
                     IsCheckable = true,
                     IsChecked = tile.Size == sizeValue
                 };
@@ -4757,10 +4763,9 @@ namespace TileBoard
                     Save();
                     RenderAll();
                 };
-                menu.Items.Add(mi);
+                resize.Items.Add(mi);
             }
-
-            menu.Items.Add(new Separator());
+            menu.Items.Add(resize);
 
             var moveMenu = new MenuItem { Header = "移到分组", Icon = MenuIcon("\uE838") };
             if (_layout != null)
@@ -4801,15 +4806,28 @@ namespace TileBoard
 
             menu.Items.Add(new Separator());
 
-            var appearanceItem = new MenuItem { Header = "个性化设置…", Icon = MenuIcon("\uE790") };
-            appearanceItem.Click += (s, e) => ShowSettingsPage();
-            menu.Items.Add(appearanceItem);
+            // Win10 同款应用级动作区：文件位置 / 任务栏 / 管理员 / 卸载
+            var openLocation = new MenuItem { Header = "打开文件位置", Icon = MenuIcon("\uE8B7") };
+            openLocation.Click += (s, e) => OpenFileLocationFor(tile);
+            menu.Items.Add(openLocation);
+
+            var pinTaskbar = new MenuItem { Header = "添加到任务栏", Icon = MenuIcon("\uE718") };
+            pinTaskbar.Click += (s, e) => PinToTaskbarFor(tile);
+            menu.Items.Add(pinTaskbar);
+
+            var runAdmin = new MenuItem { Header = "管理员身份打开", Icon = MenuIcon("\uE7EF") };
+            runAdmin.Click += (s, e) => RunAsAdminFor(tile);
+            menu.Items.Add(runAdmin);
+
+            var uninstall = new MenuItem { Header = "卸载", Icon = MenuIcon("\uE74D") };
+            uninstall.Click += (s, e) => UninstallFor(tile);
+            menu.Items.Add(uninstall);
 
             menu.Items.Add(new Separator());
 
-            var open = new MenuItem { Header = "打开", Icon = MenuIcon("\uE768") };
-            open.Click += (s, e) => Launch(tile.Aumid);
-            menu.Items.Add(open);
+            var appearanceItem = new MenuItem { Header = "个性化设置…", Icon = MenuIcon("\uE790") };
+            appearanceItem.Click += (s, e) => ShowSettingsPage();
+            menu.Items.Add(appearanceItem);
 
             var remove = new MenuItem { Header = "从磁贴板移除", Icon = MenuIcon("\uE74D") };
             remove.Click += (s, e) =>
@@ -4821,6 +4839,195 @@ namespace TileBoard
             menu.Items.Add(remove);
 
             return menu;
+        }
+
+        // ================= 磁贴右键动作：文件位置 / 任务栏 / 管理员 / 卸载 =================
+
+        /// <summary>非路径 AUMID 在 AppsFolder 里的解析名。</summary>
+        private static string AppsItemParsing(TileItem tile)
+        {
+            return Native.NativeShell.LooksLikePath(tile.Aumid)
+                ? tile.Aumid
+                : "shell:AppsFolder\\" + tile.Aumid;
+        }
+
+        /// <summary>
+        /// 打开文件位置。桌面路径 → 资源管理器选中；
+        /// UWP → WindowsApps 包目录（Win10 原版行为）；
+        /// Win32 AUMID → 先试 shell 自己的「打开文件位置」动词，再扫开始菜单找 .lnk。
+        /// </summary>
+        private void OpenFileLocationFor(TileItem tile)
+        {
+            try
+            {
+                if (Native.NativeShell.LooksLikePath(tile.Aumid))
+                {
+                    Native.ShellActions.RevealInExplorer(tile.Aumid);
+                    return;
+                }
+
+                // Win32 AUMID：快捷方式注册的，shell 的动词能直接定位到那个 .lnk
+                if (Native.ShellActions.InvokeItemVerb(AppsItemParsing(tile), "opencontaining"))
+                    return;
+
+                // packaged 应用：打开包安装目录
+                int bang = tile.Aumid?.IndexOf('!') ?? -1;
+                if (bang > 0)
+                {
+                    string dir = Native.ShellActions.GetPackageInstallPath(
+                        tile.Aumid.Substring(0, bang));
+                    if (dir != null)
+                    {
+                        Native.ShellActions.OpenFolder(dir);
+                        return;
+                    }
+                }
+
+                // 兜底：扫开始菜单 .lnk
+                var (lnk, _) = Native.ShellActions.FindShortcutByAumid(tile.Aumid);
+                if (lnk != null)
+                {
+                    Native.ShellActions.RevealInExplorer(lnk);
+                    return;
+                }
+
+                SetStatus("找不到「" + tile.Name + "」的文件位置");
+            }
+            catch (Exception ex)
+            {
+                SetStatus("打开文件位置失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 固定到任务栏。走 shell 的 taskbarpin 规范动词。
+        /// Win10 1607 起微软把它封锁了，本机是 Win11 26200，十有八九会被拒 ——
+        /// 拒绝时如实说，别假装成功。
+        /// </summary>
+        private void PinToTaskbarFor(TileItem tile)
+        {
+            try
+            {
+                if (Native.ShellActions.InvokeItemVerb(AppsItemParsing(tile), "taskbarpin"))
+                {
+                    HideBoard();
+                    SetStatus("已固定到任务栏：" + tile.Name);
+                    return;
+                }
+
+                // 二次尝试：开始菜单快捷方式本身（部分版本对 .lnk 放行）
+                var (lnk, _) = Native.ShellActions.FindShortcutByAumid(tile.Aumid);
+                if (lnk != null &&
+                    Native.ShellActions.InvokeItemVerb(lnk, "taskbarpin"))
+                {
+                    HideBoard();
+                    SetStatus("已固定到任务栏：" + tile.Name);
+                    return;
+                }
+
+                SetStatus("此系统不允许程序固定任务栏（" +
+                          (Native.ShellActions.LastError ?? "微软已封锁该接口") +
+                          "），请手动固定");
+            }
+            catch (Exception ex)
+            {
+                SetStatus("固定任务栏失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 管理员身份运行。桌面路径 / 桌面桥应用可以直接 runas；
+        /// 纯 UWP 没有提权概念，系统会拒绝 —— 如实反馈。
+        /// </summary>
+        private void RunAsAdminFor(TileItem tile)
+        {
+            try
+            {
+                if (Native.ShellActions.InvokeItemVerb(AppsItemParsing(tile), "runas"))
+                {
+                    HideBoard();
+                    return;
+                }
+
+                // AppsFolder 项拒绝时，退回真实 exe 再提权一次（Win32 AUMID 常见）
+                var (_, target) = Native.ShellActions.FindShortcutByAumid(tile.Aumid);
+                if (target != null && Native.ShellActions.InvokeItemVerb(target, "runas"))
+                {
+                    HideBoard();
+                    return;
+                }
+
+                SetStatus("无法以管理员身份运行「" + tile.Name + "」：" +
+                          Native.ShellActions.LastError);
+            }
+            catch (Exception ex)
+            {
+                SetStatus("管理员运行失败：" + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 卸载。四档兜底：shell 卸载动词（系统自带流程，自带确认框）→
+        /// UWP 用 Remove-AppxPackage → 注册表卸载表按 exe 反查 → 应用设置页。
+        /// </summary>
+        private void UninstallFor(TileItem tile)
+        {
+            try
+            {
+                // 1) shell 自己的卸载流程 —— 有的话交给系统，确认框都是系统原生的
+                if (Native.ShellActions.InvokeItemVerb(AppsItemParsing(tile), "uninstall"))
+                {
+                    HideBoard();
+                    return;
+                }
+
+                // 2) UWP / 桌面桥：按包族名卸载（当前用户范围，等同右键磁贴卸载）
+                int bang = tile.Aumid?.IndexOf('!') ?? -1;
+                if (bang > 0)
+                {
+                    if (MessageBox.Show("要卸载「" + tile.Name + "」吗？", "卸载",
+                            MessageBoxButton.YesNo, MessageBoxImage.Warning)
+                        != MessageBoxResult.Yes) return;
+
+                    string family = tile.Aumid.Substring(0, bang);
+                    Run("powershell.exe",
+                        "-NoProfile -WindowStyle Hidden -Command " +
+                        "\"Get-AppxPackage -PackageFamilyName '" + family +
+                        "' | Remove-AppxPackage\"");
+                    SetStatus("卸载已提交：" + tile.Name);
+                    return;
+                }
+
+                // 3) 桌面程序：卸载表反查
+                string exe = Native.NativeShell.LooksLikePath(tile.Aumid)
+                    ? tile.Aumid
+                    : Native.ShellActions.FindShortcutByAumid(tile.Aumid).TargetPath;
+                if (exe != null)
+                {
+                    var (display, cmd) = Native.ShellActions.FindUninstallEntry(exe);
+                    if (cmd != null)
+                    {
+                        if (MessageBox.Show("要卸载「" + (display ?? tile.Name) + "」吗？", "卸载",
+                                MessageBoxButton.YesNo, MessageBoxImage.Warning)
+                            != MessageBoxResult.Yes) return;
+
+                        // 卸载命令带引号路径和参数，交给 cmd 解析最稳
+                        Run("cmd.exe", "/c " + cmd);
+                        SetStatus("卸载已启动：" + (display ?? tile.Name));
+                        return;
+                    }
+                }
+
+                // 4) 全都找不到：打开系统应用页让主人手动来
+                SetStatus("没找到「" + tile.Name + "」的卸载入口，已打开系统应用页");
+                System.Diagnostics.Process.Start(
+                    new System.Diagnostics.ProcessStartInfo("ms-settings:appsfeatures")
+                    { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                SetStatus("卸载失败：" + ex.Message);
+            }
         }
 
         // ================= 分组重命名 =================
