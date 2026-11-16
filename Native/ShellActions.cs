@@ -505,17 +505,44 @@ namespace TileBoard.Native
             foreach (var root in roots)
             {
                 if (string.IsNullOrEmpty(root) || !System.IO.Directory.Exists(root)) continue;
-                foreach (var lnk in System.IO.Directory.EnumerateFiles(root, "*.lnk",
-                    System.IO.SearchOption.AllDirectories))
-                {
-                    string id = ReadShortcutAumid(lnk);
-                    if (string.IsNullOrEmpty(id) ||
-                        !string.Equals(id, aumid, StringComparison.OrdinalIgnoreCase)) continue;
 
-                    hitResult = (lnk, ReadShortcutTarget(lnk));
-                    lock (_shortcutCache) _shortcutCache[aumid] = hitResult;
-                    return hitResult;
+                // 逐层手动遍历：AllDirectories 的枚举器只要碰到一个无权限子目录
+                // 就整棵树炸掉（UnauthorizedAccessException 直接冒泡），
+                // 这里每层单独 try —— 没权限的目录跳过，其余照扫
+                var pending = new System.Collections.Generic.Queue<string>();
+                pending.Enqueue(root);
+
+                while (pending.Count > 0)
+                {
+                    string dir = pending.Dequeue();
+
+                    string[] lnks = null;
+                    try { lnks = System.IO.Directory.GetFiles(dir, "*.lnk"); }
+                    catch { /* 该目录不可读，跳过 */ }
+
+                    if (lnks != null)
+                    {
+                        foreach (var lnk in lnks)
+                        {
+                            string id = ReadShortcutAumid(lnk);
+                            if (string.IsNullOrEmpty(id) ||
+                                !string.Equals(id, aumid, StringComparison.OrdinalIgnoreCase)) continue;
+
+                            hitResult = (lnk, ReadShortcutTarget(lnk));
+                            break;
+                        }
+                        if (hitResult.LnkPath != null) break;
+                    }
+
+                    try
+                    {
+                        foreach (var sub in System.IO.Directory.EnumerateDirectories(dir))
+                            pending.Enqueue(sub);
+                    }
+                    catch { /* 子目录枚举失败，跳过整层 */ }
                 }
+
+                if (hitResult.LnkPath != null) break;
             }
 
             lock (_shortcutCache) _shortcutCache[aumid] = hitResult;
