@@ -124,6 +124,15 @@ namespace TileBoard
         private bool _groupMouseDown;
         private bool _groupDragging;
 
+        // —— 双击改名识别 ——
+        // 记账放在窗口层自己做：两次都按在同一个组标题上、都没形成拖动、
+        // 间隔和位移都在系统双击门槛之内，就算一次双击。捕获时机一毫米没动
+        // （还是按下即抓），拖动手感和基线完全一致 —— 这是上一版翻车的地方。
+        private TileGroup _lastHeaderClickGroup;    // 上一次标题单击对应的组
+        private DateTime _lastHeaderClickUp;        // 那次松开的时刻
+        private Point _lastHeaderClickPos;          // 那次松开的位置
+        private bool _groupHeaderCandidate;         // 本次按下落在标题行上（区别于组内空隙）
+
         /// <summary>
         /// 分组拖动开始那一刻，全场每个分组的格位。与 _dragSnapshot 同一套账：
         /// 每次鼠标移动先按它把板面归位，再重算落点 —— 被挤开的分组才会自己回来，
@@ -188,6 +197,10 @@ namespace TileBoard
 
         [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
         [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+        [DllImport("user32.dll")] private static extern uint GetDoubleClickTime();
+        [DllImport("user32.dll")] private static extern int GetSystemMetrics(int nIndex);
+        private const int SM_CXDOUBLECLK = 36;      // 双击判定的横向容差（像素）
+        private const int SM_CYDOUBLECLK = 37;      // 双击判定的纵向容差（像素）
         [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindowW(string cls, string title);
         [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
@@ -1113,6 +1126,10 @@ namespace TileBoard
             string foldTestPath = GetArg("--foldtest");
             if (foldTestPath != null) { RunFoldTest(foldTestPath); return; }
 
+            // 调试/验收用：--renametest <txt> 验改名链路（标题进输入态 → 回车落名 → 重建）
+            string renameTestPath = GetArg("--renametest");
+            if (renameTestPath != null) { RunRenameTest(renameTestPath); return; }
+
             // 调试/验收用：--shotapps <png> 打开应用库截图
             string appsShot = GetArg("--shotapps");
             if (appsShot != null) { await CaptureAppsShot(appsShot); return; }
@@ -1281,6 +1298,38 @@ namespace TileBoard
                         lines.Add("分组名   = " + string.Join(" | ", _layout.Groups.Select(g => g.Name)));
                     }
 
+                    // ---- 捕获余量探针：压在组标题上、擦着组的边，都应该落进这组 ----
+                    var probe = _layout.Groups.FirstOrDefault(g => !g.Collapsed && g.Tiles.Count > 0);
+                    if (probe != null)
+                    {
+                        lines.Add("");
+                        lines.Add("==== 捕获余量 ====");
+
+                        Point host = GroupsHost.TranslatePoint(new Point(0, 0), this);
+                        Rect box = GroupGrid.Box(probe);
+                        double cx = host.X + box.X;
+                        double cy = host.Y + box.Y;
+                        double cr = cx + box.Width;
+                        double cb = cy + box.Height;
+
+                        _dragItem = probe.Tiles[0];
+
+                        // 1) 组标题带上 —— 核心区内部，必须命中本组
+                        var headerPt = new Point(Math.Min(cx + 20, cr - 4), cy + 12);
+                        bool headerHit = TryResolveDrop(headerPt, out TileGroup hg, out _, out _);
+                        lines.Add($"标题带命中 = {(headerHit && ReferenceEquals(hg, probe) ? "本组 ✔" : headerHit ? "别的组 ✘ " + hg?.Name : "落空 ✘")}");
+
+                        // 2) 底边下方 12px —— 新增的吸附余量，本次改动的核心
+                        var belowPt = new Point(Math.Min(cx + 20, cr - 4), cb + 12);
+                        bool belowHit = TryResolveDrop(belowPt, out TileGroup bg2, out _, out _);
+                        lines.Add($"底边外 12px = {(belowHit ? "吸进 " + bg2?.Name + " ✔" : "落空 ✘")}");
+
+                        // 3) 右边外侧 12px
+                        var rightPt = new Point(cr + 12, cy + GroupGrid.HeaderHeight + 20);
+                        bool rightHit = TryResolveDrop(rightPt, out TileGroup rg, out _, out _);
+                        lines.Add($"右边外 12px = {(rightHit ? "吸进 " + rg?.Name + " ✔" : "落空 ✘")}");
+                    }
+
                     lines.Add("");
                     lines.Add("==== 全部磁贴坐标 ====");
                     foreach (var g in _layout.Groups)
@@ -1301,8 +1350,7 @@ namespace TileBoard
         }
 
         /// <summary>把布局退回自检前的快照，并落盘。</summary>
-        private bool RestoreLayout(BoardLayout snapshot)
-        {
+        private bool RestoreLayout(BoardLayout snapshot)        {
             if (snapshot == null) return false;
 
             try
@@ -1457,6 +1505,71 @@ namespace TileBoard
             {
                 lines.Add("还原失败 " + ex.Message);
             }
+
+            System.IO.File.WriteAllLines(path, lines);
+            Application.Current.Shutdown();
+        }
+
+        /// <summary>
+        /// 改名链路自检：直接走 BeginRenameGroup（双击识别、右键改名、新建分组自动命名
+        /// 共用的同一个入口），验「标题进输入态 → 回车落名 → 标题回到纯文字态」。
+        /// 双击手势本身在自检里造不出来，识别逻辑靠人工验收。
+        /// </summary>
+        private async void RunRenameTest(string path)
+        {
+            await Task.Delay(1400);   // 等首帧布局，标题元素才有得找
+
+            var lines = new List<string>();
+            var snapshot = LayoutStore.Clone(_layout);
+            try
+            {
+                var group = _layout?.Groups.FirstOrDefault(g => g != null);
+                if (group == null)
+                {
+                    lines.Add("FAIL 板上没有分组");
+                }
+                else
+                {
+                    lines.Add("目标分组 = " + group.Name);
+                    var header = FindGroupHeader(group);
+                    lines.Add("标题元素 = " + (header != null ? "找到 ✔" : "缺失 ✘"));
+
+                    if (header != null)
+                    {
+                        BeginRenameGroup(group);
+                        lines.Add("输入框   = " + (header.Child is TextBox ? "已出现 ✔" : "没出现 ✘"));
+
+                        if (header.Child is TextBox box)
+                        {
+                            box.Text = "自检改名";
+                            var source = PresentationSource.FromVisual(box);
+                            if (source == null)
+                            {
+                                lines.Add("回车落名 = SKIP 拿不到 PresentationSource");
+                            }
+                            else
+                            {
+                                box.RaiseEvent(new KeyEventArgs(Keyboard.PrimaryDevice, source, 0, Key.Enter)
+                                { RoutedEvent = Keyboard.KeyDownEvent });
+                                lines.Add($"回车落名 = 「{group.Name}」  " +
+                                          (group.Name == "自检改名" ? "✔" : "✘"));
+                                var rebuilt = FindGroupHeader(group);
+                                lines.Add("标题重建 = " +
+                                          (rebuilt != null && rebuilt.Child is Grid
+                                              ? "✔ 回到纯文字态"
+                                              : "✘ 还是输入框"));
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                lines.Add("EX " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            if (RestoreLayout(snapshot))
+                lines.Add("已还原板面（组名回滚）");
 
             System.IO.File.WriteAllLines(path, lines);
             Application.Current.Shutdown();
@@ -3356,6 +3469,7 @@ namespace TileBoard
             block.MouseLeftButtonDown += (s, e) =>
             {
                 if (e.ChangedButton != MouseButton.Left) return;
+                _groupHeaderCandidate = false;   // 按在组内空隙上，不参与双击改名
                 BeginGroupDragCandidate(group, block, e);
             };
 
@@ -3420,6 +3534,7 @@ namespace TileBoard
                     return;
                 }
 
+                _groupHeaderCandidate = true;    // 按在标题行上，参与双击改名记账
                 BeginGroupDragCandidate(group, block, e);
             };
 
@@ -3696,6 +3811,39 @@ namespace TileBoard
                 }
                 else
                 {
+                    // 双击改名判定：上一次标题单击还没过期、还是同一个组、
+                    // 位置也没挪出系统双击容差 → 这两次按下算一次双击，进改名。
+                    // 改名在 CancelGroupDrag 之后做：板面重建完再找标题元素，
+                    // 输入框加在最新的 header 上。
+                    // 双击门槛取系统设置（控制面板里调过的都算数）：
+                    // 时限 GetDoubleClickTime，位移容差 SM_CX/CYDOUBLECLK
+                    Point upPos = e.GetPosition(this);
+                    bool sameGroup = ReferenceEquals(_lastHeaderClickGroup, _groupDragGroup)
+                                     && _lastHeaderClickGroup != null;
+                    bool inTime = (DateTime.UtcNow - _lastHeaderClickUp).TotalMilliseconds
+                                  <= GetDoubleClickTime();
+                    bool inPlace =
+                        Math.Abs(upPos.X - _lastHeaderClickPos.X) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
+                        Math.Abs(upPos.Y - _lastHeaderClickPos.Y) <= GetSystemMetrics(SM_CYDOUBLECLK);
+
+                    if (_groupHeaderCandidate && sameGroup && inTime && inPlace)
+                    {
+                        var renamed = _groupDragGroup;
+                        _lastHeaderClickGroup = null;    // 记账清掉，三击不会连环改名
+                        CancelGroupDrag();
+
+                        BeginRenameGroup(renamed);
+                        return;
+                    }
+
+                    if (_groupHeaderCandidate)
+                    {
+                        // 只有按在标题行上的单击才记账，组内空隙的单击不参与
+                        _lastHeaderClickGroup = _groupDragGroup;
+                        _lastHeaderClickUp = DateTime.UtcNow;
+                        _lastHeaderClickPos = upPos;
+                    }
+
                     CancelGroupDrag();
                 }
 
@@ -3952,6 +4100,7 @@ namespace TileBoard
         {
             _groupMouseDown = false;
             _groupDragging = false;
+            _groupHeaderCandidate = false;
 
             // 半路取消：板面退回拖动前的样子，不然被挤开的组就永远回不来了
             RestoreGroupDragSnapshot();
@@ -4177,6 +4326,20 @@ namespace TileBoard
         /// 窗口坐标 → 「哪一组的哪一格」。磁贴左上角吸附到最近的格位，而不是自由漂，
         /// 这就是 Win10 的方格限制：随便放，但只能停在格子上。
         /// </summary>
+        /// <summary>
+        /// 分组捕获余量（像素）。组与组之间只隔一个 8px 的缝，余量给太大两组就会抢
+        /// 同一个落点，18px 约等于四分之一格：擦着边走也能被吸进组里，又不至于抢到隔壁。
+        /// </summary>
+        private const double TileCaptureSlack = 18;
+
+        /// <summary>点到矩形边缘的最短距离；点在矩形内部时为 0。</summary>
+        private static double PointRectGap(Rect r, Point p)
+        {
+            double dx = p.X < r.Left ? r.Left - p.X : (p.X > r.Right ? p.X - r.Right : 0);
+            double dy = p.Y < r.Top ? r.Top - p.Y : (p.Y > r.Bottom ? p.Y - r.Bottom : 0);
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
         private bool TryResolveDrop(Point p, out TileGroup group, out int col, out int row)
         {
             group = null;
@@ -4184,44 +4347,47 @@ namespace TileBoard
             if (_layout == null || _dragItem == null) return false;
 
             int sx = Math.Clamp(_dragItem.SpanX, 1, TileMetrics.GridColumns);
-            int sy = Math.Max(1, _dragItem.SpanY);
 
             // 命中区完全按模型算，不看可视元素 —— 分组画在哪儿由 (Column, Row) 唯一决定，
             // 两者本来就是同一个矩形。走视觉树有两个坑：面板刚重建还没过布局时 RenderSize 是 0，
             // 命中会漏；子元素顺序和 _layout.Groups 的下标也未必对得上。
             Point host = GroupsHost.TranslatePoint(new Point(0, 0), this);
 
+            // 第一轮：把「够得着」的组都收进来。核心区连标题带一起算 —— 拖到组标题上
+            // 就该落进这组；核心区外再放一圈余量，单独一块磁贴往回拖时不用像素级对准。
+            var reachable = new List<(TileGroup G, Rect Core, double Gap)>();
             foreach (var g in _layout.Groups)
             {
                 if (g == null) continue;
 
                 Rect box = GroupGrid.Box(g);
-                double panelX = host.X + box.X;
-                double panelY = host.Y + box.Y + GroupGrid.HeaderHeight;
-                double panelW = box.Width;
-                double panelH = Math.Max(0, box.Height - GroupGrid.HeaderHeight);
+                var core = new Rect(
+                    host.X + box.X, host.Y + box.Y,
+                    Math.Max(box.Width, TileMetrics.Pixels(Math.Min(4, TileMetrics.GridColumns))),
+                    box.Height);
 
-                // 组宽只到「用到的列数」，但 Win10 的分组能往外长列，
-                // 所以命中区至少放宽到 4 格宽，底部再给 16px 吸附余量
-                var hit = new Rect(panelX, panelY,
-                                   Math.Max(panelW, TileMetrics.Pixels(Math.Min(4, TileMetrics.GridColumns))) + 8,
-                                   panelH + 16);
-                if (!hit.Contains(p)) continue;
-
-                double left = p.X - panelX - _grabOffset.X;
-                double top = p.Y - panelY - _grabOffset.Y;
-
-                col = (int)Math.Round(left / TileMetrics.Stride);
-                row = (int)Math.Round(top / TileMetrics.Stride);
-
-                col = Math.Clamp(col, 0, Math.Max(0, TileMetrics.GridColumns - sx));
-                row = Math.Max(0, row);
-
-                group = g;
-                return true;
+                double gap = PointRectGap(core, p);
+                if (gap <= TileCaptureSlack) reachable.Add((g, core, gap));
             }
 
-            return false;
+            if (reachable.Count == 0) return false;
+
+            // 第二轮：几个组同时够得着时，离谁的真实矩形近就归谁 —— 余量只放大手感，不抢地盘
+            reachable.Sort((a, b) => a.Gap.CompareTo(b.Gap));
+            var best = reachable[0];
+
+            // 左上角换算成组内格位（磁贴区从标题带下面起算）；落在标题上时 top 为负，夹回 0 行
+            double left = p.X - best.Core.X - _grabOffset.X;
+            double top = p.Y - (best.Core.Y + GroupGrid.HeaderHeight) - _grabOffset.Y;
+
+            col = (int)Math.Round(left / TileMetrics.Stride);
+            row = (int)Math.Round(top / TileMetrics.Stride);
+
+            col = Math.Clamp(col, 0, Math.Max(0, TileMetrics.GridColumns - sx));
+            row = Math.Max(0, row);
+
+            group = best.G;
+            return true;
         }
 
         /// <summary>拖到组外时在落点画一个虚线框，表示松手会长出一个新分组。</summary>
