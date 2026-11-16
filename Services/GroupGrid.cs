@@ -60,13 +60,22 @@ namespace TileBoard.Services
             new Rect(col * TileMetrics.Stride, row * TileMetrics.Stride, PixelWidth(g), PixelHeight(g));
 
         /// <summary>
-        /// 整理整块板面：把没有坐标的分组装箱，把越界的分组夹回可视范围，
-        /// 把互相压住的分组挤开。幂等。
+        /// 整理整块板面：把没有坐标的分组装箱，把互相压住的分组挤开。幂等。
+        ///
+        /// 多屏改版：板面可以横向滚动，内容比视口宽是合法状态 ——
+        /// 所以已有坐标的分组绝不按视口列数夹回（一夹就是整板重排，
+        /// 宽屏摆好的布局到窄屏全毁）。只有「装箱新分组」才受视口列数约束。
         /// </summary>
         public static void Normalize(BoardLayout layout, int columns)
         {
             if (layout?.Groups == null || layout.Groups.Count == 0) return;
             columns = Math.Max(1, columns);
+
+            // 锚定组的合法范围 = 已有格位自己撑开的宽度，只会比视口宽、绝不比它窄
+            int anchorCols = columns;
+            foreach (var g in layout.Groups)
+                if (g != null && g.Column >= 0 && g.Row >= 0)
+                    anchorCols = Math.Max(anchorCols, g.Column + Math.Max(1, SpanColumns(g)));
 
             var placed = new List<TileGroup>();
 
@@ -79,12 +88,13 @@ namespace TileBoard.Services
 
             foreach (var g in anchored)
             {
-                int sc = Math.Clamp(SpanColumns(g), 1, columns);
-                int wantCol = Math.Clamp(g.Column, 0, Math.Max(0, columns - sc));
+                // anchorCols 由锚定组自己的格位撑出来，这两个 Clamp 恒等 —— 坐标原样保留
+                int sc = Math.Clamp(SpanColumns(g), 1, anchorCols);
+                int wantCol = Math.Clamp(g.Column, 0, Math.Max(0, anchorCols - sc));
                 int wantRow = Math.Max(0, g.Row);
 
                 int col, row;
-                if (!TryFind(placed, g, wantCol, wantRow, columns, out col, out row))
+                if (!TryFind(placed, g, wantCol, wantRow, anchorCols, out col, out row))
                 {
                     col = wantCol;
                     row = wantRow;

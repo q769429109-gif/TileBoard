@@ -71,9 +71,9 @@
                 MouseRightButtonUp="BoardSurface_MouseRightButtonUp">
             <ScrollViewer x:Name="BoardScroll"
                           VerticalScrollBarVisibility="Auto"
-                          HorizontalScrollBarVisibility="Disabled">
+                          HorizontalScrollBarVisibility="Visible">
                 <!-- 分组不再是 WrapPanel 顺着流，而是按自己的 (Column, Row) 落位，
-                     这样才能被拖到板面任意格位 -->
+                     这样才能被拖到板面任意格位。内容比视口宽时出横向位置条 -->
                 <controls:GroupCanvas x:Name="GroupsHost" Margin="17,16,4,20"/>
             </ScrollViewer>
         </Border>

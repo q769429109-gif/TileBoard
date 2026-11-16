@@ -182,6 +182,21 @@ namespace TileBoard
         // 外观设置（面板宽度、亚克力开关），与磁贴布局分开存
         private readonly UiSettings _ui = UiSettings.Load();
 
+        // 面板当前停靠的那块屏（工作区 DIP + 物理矩形 + DPI）。
+        // 唤出时按鼠标所在屏重选 —— 这是「副屏也能出面板」的核心，
+        // 其余所有几何计算一律用 WorkArea()（即 _screen.Dip），不再碰主屏专属的 SystemParameters.WorkArea
+        private Native.Screens.Info _screen;
+
+        /// <summary>毛玻璃底图是用哪块屏的物理矩形抓的。矩形没变就不重抓（省一次全屏 BitBlt）。</summary>
+        private Rect _glassCapturedRect;
+
+        /// <summary>当前停靠屏的工作区（DIP）。_screen 还没就绪时退回主屏。</summary>
+        private Rect WorkArea() => _screen?.Dip ?? SystemParameters.WorkArea;
+
+        // 板面重排防抖令牌：跨屏 DPI 切换时 WPF 会临时改写窗口宽高（见 OnDpiChanged），
+        // 中间尺寸量出来的列数是假的，只有最后一次 SizeChanged 才是尘埃落定的真宽度
+        private int _layoutReflowToken;
+
         // 右边缘拖拽改宽度
         private bool _resizing;
         private double _resizeStartX;
@@ -217,6 +232,18 @@ namespace TileBoard
         private const int GWL_EXSTYLE = -20;
         private const int WS_EX_TOOLWINDOW = 0x00000080;
 
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint flags);
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOZORDER = 0x0004;
+        private const uint SWP_NOACTIVATE = 0x0010;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct WinRect { public int Left, Top, Right, Bottom; }
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out WinRect rect);
+
         public MainWindow()
         {
             InitializeComponent();
@@ -227,6 +254,7 @@ namespace TileBoard
             KeyDown += OnKeyDown;
             MouseMove += OnWindowMouseMove;
             MouseLeftButtonUp += OnWindowMouseLeftButtonUp;
+            DpiChanged += OnDpiChanged;
 
             _toastTimer = new System.Windows.Threading.DispatcherTimer
             {
@@ -239,11 +267,22 @@ namespace TileBoard
             };
 
             // 面板改宽后，分组按列重新等距分布，别让右边空一大条；
-            // 应用库的宽度也要跟着走，否则窄板上它会把磁贴区吃掉大半
+            // 应用库的宽度也要跟着走，否则窄板上它会把磁贴区吃掉大半。
+            //
+            // 这里必须防抖、只认最后一次尺寸：跨屏唤出时 WPF 按「物理尺寸不变」临时改写
+            // 窗口 DIP 宽高（主屏 150% 存的 560，挪到 100% 屏瞬间变 840），中间量出来的
+            // 列数是假的 —— 按它重排会把整板装箱打乱。令牌对不上 = 过期尺寸，直接作废。
             BoardScroll.SizeChanged += (s, e) =>
             {
-                UpdateGroupLayout();
-                UpdateAppsPanelWidth();
+                int token = ++_layoutReflowToken;
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (token != _layoutReflowToken) return;
+
+                    UpdateGroupLayout();
+                    UpdateAppsPanelWidth();
+                    LogHookState2($"reflow cols={_lastColumns} W={Width:0}");
+                }), System.Windows.Threading.DispatcherPriority.Background);
             };
 
             // 窗口尺寸/位置一动，垫底那张桌面图就得跟着挪，否则全屏时会整体错位
@@ -446,12 +485,34 @@ namespace TileBoard
         }
 
         /// <summary>
+        /// 跨屏必经的一站：窗口挪到 DPI 不同的显示器时，WPF 的默认动作是把宽高按
+        /// 「物理尺寸不变」重新换算 —— 主屏 150% 存的 560 DIP，到 100% 屏会被撑成 840 DIP，
+        /// 面板凭空胖一圈；Left/Top 也会被按旧 DPI 折算，落点跟着偏。
+        /// 这里把几何按目标屏改回去（_screen.Dip 就是按目标屏 DPI 换算的），
+        /// 尺寸抖动交给 SizeChanged 的防抖吸收 —— 只认最后一次。
+        /// </summary>
+        private void OnDpiChanged(object sender, DpiChangedEventArgs e)
+        {
+            // WPF 会发 1.00->1.00 这种假 DPI 事件（启动时连发五条实测）——
+            // 没真变就不响应，否则每次唤出都白跑一遍几何纠偏
+            if (e.NewDpi.DpiScaleX == e.OldDpi.DpiScaleX &&
+                e.NewDpi.DpiScaleY == e.OldDpi.DpiScaleY) return;
+
+            LogHookState2($"dpi {e.OldDpi.DpiScaleX:0.00}->{e.NewDpi.DpiScaleX:0.00} W={Width:0}");
+            if (_screen != null)
+            {
+                ApplyWin10Geometry();
+                LogHookState2($"  dpi after L={Left:0} T={Top:0} W={Width:0} H={Height:0}");
+            }
+        }
+
+        /// <summary>
         /// 贴左下角。全屏时宽高都等于工作区；非全屏时用上次拖出来的宽高，底边贴住工作区底部。
         /// Win10 的开始菜单也是从底部往上长的，所以这里对齐的是底边而不是顶边。
         /// </summary>
         private void ApplyWin10Geometry()
         {
-            Rect work = SystemParameters.WorkArea;
+            Rect work = WorkArea();   // 当前停靠屏的工作区，不再写死主屏
 
             double w = _ui.FullScreen
                 ? work.Width
@@ -482,7 +543,8 @@ namespace TileBoard
         {
             if (GlassImage == null) return;
 
-            Rect work = SystemParameters.WorkArea;
+            // 底图抓的是 _screen.Physical 那块屏，对位必须用同一块屏的 DIP 工作区
+            Rect work = WorkArea();
 
             GlassImage.HorizontalAlignment = HorizontalAlignment.Left;
             GlassImage.VerticalAlignment = VerticalAlignment.Top;
@@ -526,7 +588,7 @@ namespace TileBoard
             // 窗口不透明的时候绝对不能抓，抓到的会是自己。
             if (_ui.Acrylic && !Services.Glass.HasImage && RootGrid != null && RootGrid.Opacity < 0.05)
             {
-                if (Services.Glass.Capture(handle))
+                if (Services.Glass.Capture(handle, _screen?.Physical ?? Rect.Empty))
                 {
                     var g = Services.Glass.Current;
                     LogHookState2($"Glass capture (apply) {g.PixelWidth}x{g.PixelHeight}");
@@ -631,7 +693,7 @@ namespace TileBoard
         /// </summary>
         private void SyncSizeControls()
         {
-            Rect work = SystemParameters.WorkArea;
+            Rect work = WorkArea();
 
             WidthSlider.Minimum = MinPanelWidth;
             WidthSlider.Maximum = Math.Max(MinPanelWidth, work.Width);
@@ -769,7 +831,7 @@ namespace TileBoard
         {
             if (!_appearanceReady || _ui.FullScreen) return;
 
-            double w = Math.Clamp(e.NewValue, MinPanelWidth, SystemParameters.WorkArea.Width);
+            double w = Math.Clamp(e.NewValue, MinPanelWidth, WorkArea().Width);
             _ui.PanelWidth = w;
             _ui.FullScreen = false;
 
@@ -787,7 +849,7 @@ namespace TileBoard
         {
             if (!_appearanceReady || _ui.FullScreen) return;
 
-            double h = Math.Clamp(e.NewValue, MinPanelHeight, SystemParameters.WorkArea.Height);
+            double h = Math.Clamp(e.NewValue, MinPanelHeight, WorkArea().Height);
             _ui.PanelHeight = h;
             _ui.FullScreen = false;
 
@@ -805,7 +867,7 @@ namespace TileBoard
         {
             if (!_appearanceReady || _ui.FullScreen) return;
 
-            Rect work = SystemParameters.WorkArea;
+            Rect work = WorkArea();
             bool want = FullWidthCheck.IsChecked == true;
             bool isFull = Width >= work.Width - 1;
             if (want == isFull) return;
@@ -891,7 +953,7 @@ namespace TileBoard
             _resizing = true;
             _resizeStartX = e.GetPosition(this).X;
             _resizeStartWidth = Width;
-            if (Width < SystemParameters.WorkArea.Width - 1) _restoreWidth = Width;
+            if (Width < WorkArea().Width - 1) _restoreWidth = Width;
             ResizeGrip.CaptureMouse();
             e.Handled = true;
         }
@@ -900,7 +962,7 @@ namespace TileBoard
         {
             if (!_resizing) return;
 
-            double work = SystemParameters.WorkArea.Width;
+            double work = WorkArea().Width;
             double target = _resizeStartWidth + (e.GetPosition(this).X - _resizeStartX);
             Width = Math.Clamp(target, MinPanelWidth, Math.Max(MinPanelWidth, work));
             e.Handled = true;
@@ -940,7 +1002,7 @@ namespace TileBoard
         {
             if (!_resizingH) return;
 
-            Rect work = SystemParameters.WorkArea;
+            Rect work = WorkArea();
             double dy = PointToScreen(e.GetPosition(this)).Y - _resizeStartY;
 
             // 顶部往下拖 = 变矮，底边始终贴住工作区底部
@@ -970,7 +1032,7 @@ namespace TileBoard
 
             if (!_ui.FullScreen)
             {
-                Rect work = SystemParameters.WorkArea;
+                Rect work = WorkArea();
 
                 if (_ui.PanelWidth <= 0 || _ui.PanelWidth >= work.Width - 1)
                     _ui.PanelWidth = Math.Min(960, work.Width);
@@ -990,7 +1052,7 @@ namespace TileBoard
         /// <summary>双击右边缘：满屏宽度 ↔ 上次的宽度。</summary>
         private void ToggleFullWidth()
         {
-            double work = SystemParameters.WorkArea.Width;
+            double work = WorkArea().Width;
 
             if (Width >= work - 1)
             {
@@ -3385,8 +3447,15 @@ namespace TileBoard
             HideSettingsPage(false);
             HidePhonePage();
 
+            // 多屏方案改版：面板不再跨屏跳动。跨屏 = DPI 重缩放 + 几何重提交，
+            // 闪一下还牵连整板重排 —— 这些坑全趟过了。
+            // 现在面板始终停在它自己所在的那块屏（启动即在主屏），
+            // 多屏需求交给横向位置条：板面内容可以比面板宽，滑过去看。
+            if (Native.Screens.TryOfWindow(new WindowInteropHelper(this).Handle, out Native.Screens.Info winScreen))
+                _screen = winScreen;
+
             // 尺寸只在真的变了才改，避免无谓的重建
-            Rect work = SystemParameters.WorkArea;
+            Rect work = WorkArea();
             double wantW = Math.Clamp(_ui.PanelWidth > 0 ? _ui.PanelWidth : 560,
                                       MinPanelWidth, Math.Max(MinPanelWidth, work.Width));
             if (Math.Abs(Width - wantW) > 0.5) ApplyWin10Geometry();
@@ -3398,23 +3467,46 @@ namespace TileBoard
             RootShift.Y = 10;
 
             // 抓毛玻璃底图必须赶在本窗口重新可见之前：此刻屏幕上是真桌面，抓不到自己。
-            // 之后整段显示期间都复用这张图，拖滑块只是重新模糊它，不必再截屏。
+            // 底图按整块工作区抓，面板永远是它的子矩形，所以同一块屏抓一次就够 ——
+            // 面板现在锁死在固定屏上，桌面对我们来说只是「模糊的背景」，没必要每次
+            // 唤出都全屏 BitBlt 一遍（2560x1392 一抓 30~60ms，还把模糊档位缓存全冲掉）。
+            // 只有第一次、或屏幕矩形变了（换分辨率、改工作区）才重抓。
             if (_ui.Acrylic)
             {
-                bool got = Services.Glass.Capture(new WindowInteropHelper(this).Handle);
-                var raw = Services.Glass.Current;
-                LogHookState2(got && raw != null
-                    ? $"Glass capture {raw.PixelWidth}x{raw.PixelHeight}"
-                    : "Glass capture failed -> 退回 DWM 亚克力");
+                Rect phys = _screen?.Physical ?? Rect.Empty;
+                bool needRecapture = !Services.Glass.HasImage
+                                     || !phys.Equals(_glassCapturedRect);
+
+                if (needRecapture)
+                {
+                    bool got = Services.Glass.Capture(new WindowInteropHelper(this).Handle, phys);
+                    var raw = Services.Glass.Current;
+                    LogHookState2(got && raw != null
+                        ? $"Glass capture {raw.PixelWidth}x{raw.PixelHeight}"
+                        : "Glass capture failed -> 退回 DWM 亚克力");
+
+                    _glassCapturedRect = got ? phys : Rect.Empty;
+                }
             }
 
             ApplyAppearance(new WindowInteropHelper(this).Handle);
 
-            Topmost = true;             // 只置顶一次，播放完就不再动它
+            // 置顶必须在 Show() 之前设定：若先 Show 再置顶，窗口会先以非置顶身份
+            // 合成一帧，紧接着 Topmost 把它踢进置顶层 —— DWM 重排 Z 序的那一下
+            // 就是「每次唤起闪一下」的元凶（2026-11-17 实锤：HideBoard 收尾每次
+            // 都 Topmost=false，ShowBoard 又 true，每次唤出都白折腾一遍 Z 序）。
+            // 现在永久保持置顶：窗口隐藏时根本不上屏，置顶与否毫无副作用。
+            Topmost = true;
             Show();
             Activate();
             SetForegroundWindow(new WindowInteropHelper(this).Handle);
             _shownAt = DateTime.UtcNow;
+
+            // 诊断闪烁：Show 落定后的真实物理矩形。它若和 summon 日志里的目标几何不一致，
+            // 就是 WPF 在可见之后还在动窗口 —— 闪一下就发生在这一步
+            IntPtr hwndShown = new WindowInteropHelper(this).Handle;
+            if (GetWindowRect(hwndShown, out WinRect wr))
+                LogHookState2($"shown phys={wr.Left},{wr.Top} {wr.Right - wr.Left}x{wr.Bottom - wr.Top}");
 
             // 淡入不交给 BeginAnimation：满屏分层窗口的首帧合成会把 UI 线程憋住 ~100ms，
             // 动画时钟和 Render 优先级的回调都在这条被憋住的队伍里，实测要么拖到首帧
@@ -3488,7 +3580,9 @@ namespace TileBoard
                 RootShift.BeginAnimation(TranslateTransform.YProperty, null);
                 RootGrid.Opacity = 0;
                 RootShift.Y = 10;
-                Topmost = false;
+                // Topmost 保持 true 永不撤销 —— 唤出时若从非置顶切回置顶，
+                // DWM 重排 Z 序就是唤起闪烁的元凶（见 ShowBoard 内注释）。
+                // 窗口隐藏后不上屏，置顶属性没有任何副作用。
                 _hiding = false;
                 Hide();
             };
@@ -3575,14 +3669,14 @@ namespace TileBoard
         /// </summary>
         private int CurrentColumns()
         {
-            // 取「窗口反推」和「画布实测」里更大的那个。
-            // 首帧画布的 ActualWidth 还是上一次布局的值（比如 XAML 里的 560），
-            // 只有它会把整块板按窄版装箱，之后宽度生效也回不来了。
+            // 取「窗口反推」和「视口实测」里更大的那个。
+            // 注意用 BoardScroll.ViewportWidth 而不是 GroupsHost.ActualWidth ——
+            // 板面支持横向滚动后，画布宽度是「内容撑开的范围」，可能比视口宽得多，
+            // 按它算装箱列数会把新分组装到视口外面去。
             double byWindow = Width - 48 - 6 - 34;      // 图标栏 + 拖拽条 + 左右边距
-            double byHost = GroupsHost?.ActualWidth ?? 0;
-
-            if (byHost <= 0 && BoardScroll != null && BoardScroll.ViewportWidth > 0)
-                byHost = Math.Max(0, BoardScroll.ViewportWidth - 21);
+            double byHost = BoardScroll != null && BoardScroll.ViewportWidth > 0
+                ? Math.Max(0, BoardScroll.ViewportWidth - 21)
+                : 0;
 
             double w = Math.Max(byHost, byWindow);
 

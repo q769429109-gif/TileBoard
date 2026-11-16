@@ -1,4 +1,5 @@
 using System;
+using System.Windows;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using TileBoard.Native;
@@ -35,9 +36,19 @@ namespace TileBoard.Services
         /// 窗口隐藏时调用，抓一张背后的桌面（整块工作区）。
         /// 抓不到就保持 null，调用方退回 DWM 亚克力。
         /// </summary>
-        internal static bool Capture(IntPtr hwnd)
+        internal static bool Capture(IntPtr hwnd) => Capture(hwnd, Rect.Empty);
+
+        /// <summary>
+        /// 带目标屏物理矩形的多屏版本：面板要出在副屏时，hwnd 可能还挂在主屏上，
+        /// 按窗口所在屏抓就会抓错 —— 所以调用方直接把目标屏的工作区物理矩形递进来。
+        /// Empty 则退回按 hwnd 所在屏抓。
+        /// </summary>
+        internal static bool Capture(IntPtr hwnd, Rect physical)
         {
-            _raw = ScreenCapture.GrabWorkArea(hwnd);
+            _raw = physical.IsEmpty
+                ? ScreenCapture.GrabWorkArea(hwnd)
+                : ScreenCapture.Grab((int)physical.X, (int)physical.Y,
+                                     (int)physical.Width, (int)physical.Height);
             Cache.Clear();
             return _raw != null;
         }
