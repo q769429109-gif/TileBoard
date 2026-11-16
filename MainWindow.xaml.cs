@@ -1040,6 +1040,21 @@ namespace TileBoard
             // 开机自启时不主动弹出来，等按 Win 键
             if (HasFlag("--autostart")) Hide();
 
+            // 一次性维护：--autostart-on / --autostart-off 直接写/删 HKCU Run 键。
+            // 写完继续正常启动（面板照常弹出），关则写完就退。
+            if (HasFlag("--autostart-on"))
+            {
+                bool ok = Services.Autostart.Enable();
+                LogHookState2($"autostart enable: {(ok ? "ok" : "FAILED")} -> " +
+                              Services.Autostart.CommandPreview());
+            }
+            if (HasFlag("--autostart-off"))
+            {
+                Services.Autostart.Disable();
+                Application.Current.Shutdown();
+                return;
+            }
+
             // 调试/验收用：--layoutdump <txt> 打印列数与每组坐标
             string dumpPath = GetArg("--layoutdump");
             if (dumpPath != null) { DumpLayout(dumpPath); return; }

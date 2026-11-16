@@ -37,6 +37,13 @@ namespace TileBoard.Services
             }
         }
 
+        /// <summary>给日志用的命令预览（内部字段只读展示，不暴露真实可写入口）。</summary>
+        internal static string CommandPreview()
+        {
+            string exe = Environment.ProcessPath;
+            return string.IsNullOrEmpty(exe) ? "(null)" : $"\"{exe}\" --autostart";
+        }
+
         internal static bool Enable()
         {
             try
