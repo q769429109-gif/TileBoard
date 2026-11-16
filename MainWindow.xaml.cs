@@ -4852,9 +4852,10 @@ namespace TileBoard
         }
 
         /// <summary>
-        /// 打开文件位置。桌面路径 → 资源管理器选中；
-        /// UWP → WindowsApps 包目录（Win10 原版行为）；
-        /// Win32 AUMID → 先试 shell 自己的「打开文件位置」动词，再扫开始菜单找 .lnk。
+        /// 打开文件位置 = 资源管理器定位到「文件属性里显示的那个地址」并选中：
+        /// 桌面路径 → 直接定位；UWP → 包安装目录（WindowsApps 下真实所在）；
+        /// Win32 → 开始菜单 .lnk 解析出目标 exe，定位 exe 本身（属性「目标」那个路径）。
+        /// shell 的 opencontaining 只做最后兜底（它对不少 AUMID 会失败）。
         /// </summary>
         private void OpenFileLocationFor(TileItem tile)
         {
@@ -4866,11 +4867,7 @@ namespace TileBoard
                     return;
                 }
 
-                // Win32 AUMID：快捷方式注册的，shell 的动词能直接定位到那个 .lnk
-                if (Native.ShellActions.InvokeItemVerb(AppsItemParsing(tile), "opencontaining"))
-                    return;
-
-                // packaged 应用：打开包安装目录
+                // packaged 应用：包安装目录就是它的「文件属性地址」
                 int bang = tile.Aumid?.IndexOf('!') ?? -1;
                 if (bang > 0)
                 {
@@ -4883,13 +4880,23 @@ namespace TileBoard
                     }
                 }
 
-                // 兜底：扫开始菜单 .lnk
-                var (lnk, _) = Native.ShellActions.FindShortcutByAumid(tile.Aumid);
-                if (lnk != null)
+                // Win32 AUMID：.lnk 解析出目标 exe，定位到 exe（属性里的「目标」）
+                var (lnk, target) = Native.ShellActions.FindShortcutByAumid(tile.Aumid);
+                if (target != null && System.IO.File.Exists(target))
+                {
+                    Native.ShellActions.RevealInExplorer(target);
+                    return;
+                }
+                if (lnk != null && System.IO.File.Exists(lnk))
                 {
                     Native.ShellActions.RevealInExplorer(lnk);
                     return;
                 }
+
+                // 全没解析出来：shell 自己的「打开文件位置」动词兜底（已静默失败）
+                if (Native.ShellActions.InvokeItemVerb(
+                        AppsItemParsing(tile), "opencontaining"))
+                    return;
 
                 SetStatus("找不到「" + tile.Name + "」的文件位置");
             }

@@ -324,8 +324,11 @@ namespace TileBoard.Native
                 var sei = new SHELLEXECUTEINFO
                 {
                     cbSize = Marshal.SizeOf<SHELLEXECUTEINFO>(),
+                    // SEE_MASK_FLAG_NO_UI：失败静默返回，错误交给调用方兜底 ——
+                    // 否则 ShellExecuteEx 自己弹系统错误框，兜底链根本没机会跑
                     fMask = 0x00004000 /*SEE_MASK_UNICODE*/ | 0x00000004 /*SEE_MASK_IDLIST*/
-                          | 0x0000000C /*SEE_MASK_INVOKEIDLIST*/,
+                          | 0x0000000C /*SEE_MASK_INVOKEIDLIST*/
+                          | 0x00000400 /*SEE_MASK_FLAG_NO_UI*/,
                     lpVerb = verb,
                     nShow = SW_SHOWNORMAL,
                     lpIDList = pidl
