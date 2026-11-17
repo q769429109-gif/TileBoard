@@ -14,6 +14,7 @@ using System.Windows.Media;
 using System.Windows.Media.Animation;
 using System.Windows.Media.Effects;
 using System.Windows.Media.Imaging;
+using System.Windows.Shapes;
 using TileBoard.Controls;
 using TileBoard.Models;
 using TileBoard.Services;
@@ -115,6 +116,13 @@ namespace TileBoard
         /// <summary>最近一次磁贴落点的板面坐标，新分组就生在那一格。</summary>
         private Point _lastBoardPoint;
 
+        /// <summary>
+        /// 板面右键那一刻鼠标的位置（GroupsHost 局部坐标）。
+        /// 菜单项是异步回调 —— 等它跑起来时事件参数早没了，鼠标也可能挪开，
+        /// 所以必须在下右键的那一刻把落点记下来，「新建空白磁贴」才知道该生在哪儿。
+        /// </summary>
+        private Point _contextBoardPoint;
+
         /// <summary>刚点「新建分组」建出来、还没放磁贴的那个组，暂时不清理。</summary>
         private TileGroup _keepEmptyGroup;
 
@@ -199,6 +207,14 @@ namespace TileBoard
         private Point _panOrigin;
         private double _panH;
         private double _panV;
+
+        // —— 滚轮惯性 ——
+        // 滚轮事件不再直接滚：每格滚轮往 _scrollVel 里加一把速度，逐帧按 exp(-dt·k) 衰减，
+        // 速度掉到阈值以下或者顶到板面边缘就收尾。幅度（每格加多少、衰减多快）由设置里的
+        // 滚动惯性档位给 —— 0 档根本不进这条链，滚轮行为退回 WPF 原生。
+        private double _scrollVel;          // 当前纵向速度，px/s，正 = 往下
+        private TimeSpan _scrollLastFrame;  // 上一帧的渲染时间，算 dt 用
+        private bool _scrollAnimating;      // Rendering 挂没挂着，防重复订阅
 
         // 右边缘拖拽改宽度
         private bool _resizing;
@@ -320,8 +336,11 @@ namespace TileBoard
                 e.Handled = true;
             };
 
-            // 窗口尺寸/位置变化不再需要挪垫底图 —— 自绘毛玻璃链已退役（2026-11-17）
+            // 滚轮惯性：接管滚轮事件，按设置里的幅度累积速度，逐帧衰减着滑。
+            // Preview 阶段截走，磁贴/分组谁也收不到 —— 和中键平移同一套思路。
+            BoardScroll.PreviewMouseWheel += BoardScroll_PreviewMouseWheel;
 
+            // 窗口尺寸/位置变化不再需要挪垫底图 —— 自绘毛玻璃链已退役（2026-11-17）
             // 又有人双击了一次 exe：那个实例被单实例挡下，只留这条信号过来
             Native.SingleInstance.ShowRequested += () =>
                 Dispatcher.BeginInvoke(new Action(() =>
@@ -611,6 +630,69 @@ namespace TileBoard
             catch { }
         }
 
+        // ================= 滚轮惯性 =================
+
+        /// <summary>滚轮进来：按惯性档位把速度加一笔，然后让逐帧动画去花。</summary>
+        private void BoardScroll_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
+        {
+            double inertia = Math.Clamp(_ui.ScrollInertia, 0, 100);
+            if (inertia <= 0) return;   // 0 档 = 关，直接走 WPF 原生滚动
+
+            e.Handled = true;
+
+            // 一格滚轮 Δ=120。档位 100 时每格 ≈ 840 px/s 初速，配 τ≈0.2s 的衰减，
+            // 一格能多滑出 170px 左右；档位就是按比例放大这条尾巴。
+            // WPF 的 Delta 往前滚（向上）为正，而 VerticalOffset 往下为正 —— 方向取反
+            _scrollVel = Math.Clamp(_scrollVel - e.Delta * (inertia / 100.0) * 7.0, -6000, 6000);
+            StartInertiaScroll();
+        }
+
+        private void StartInertiaScroll()
+        {
+            if (_scrollAnimating) return;
+            _scrollAnimating = true;
+            _scrollLastFrame = TimeSpan.Zero;
+            CompositionTarget.Rendering += InertiaFrame;
+        }
+
+        private void InertiaFrame(object sender, EventArgs e)
+        {
+            var args = (RenderingEventArgs)e;
+            double dt = _scrollLastFrame == TimeSpan.Zero
+                ? 0
+                : (args.RenderingTime - _scrollLastFrame).TotalSeconds;
+            _scrollLastFrame = args.RenderingTime;
+            if (dt <= 0) return;
+
+            // 速度太小就收尾：别让 Rendering 空转，也别出现永远滑不完的一像素
+            if (Math.Abs(_scrollVel) < 12)
+            {
+                StopInertiaScroll();
+                return;
+            }
+
+            double max = Math.Max(0, BoardScroll.ScrollableHeight);
+            double y = BoardScroll.VerticalOffset + _scrollVel * dt;
+
+            // 顶到板面上下缘：停在边上，剩下的速度作废
+            if (y <= 0 || y >= max)
+            {
+                BoardScroll.ScrollToVerticalOffset(Math.Clamp(y, 0, max));
+                StopInertiaScroll();
+                return;
+            }
+
+            BoardScroll.ScrollToVerticalOffset(y);
+            _scrollVel *= Math.Exp(-dt * 5.0);
+        }
+
+        private void StopInertiaScroll()
+        {
+            _scrollVel = 0;
+            _scrollAnimating = false;
+            CompositionTarget.Rendering -= InertiaFrame;
+        }
+
         // ================= 设置页 / 手机页 =================
 
         /// <summary>切到设置页（整块替换磁贴区），并把控件对到当前设置。</summary>
@@ -626,6 +708,7 @@ namespace TileBoard
             OpacitySlider.Value = Math.Round(Math.Clamp(_ui.BackOpacity, 0.15, 1.0) * 100);
             FullScreenCheck.IsChecked = _ui.FullScreen;
             AcrylicCheck.IsChecked = _ui.Acrylic;
+            InertiaSlider.Value = Math.Round(Math.Clamp(_ui.ScrollInertia, 0, 100));
 
             SyncSizeControls();
             AutostartCheck.IsChecked = Services.Autostart.IsEnabled();
@@ -723,6 +806,7 @@ namespace TileBoard
         private void UpdateAppearanceLabels()
         {
             if (OpacityValue != null) OpacityValue.Text = $"{Math.Round(_ui.BackOpacity * 100)}%";
+            if (InertiaValue != null) InertiaValue.Text = $"{Math.Round(_ui.ScrollInertia)}";
         }
 
         private void OpacitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -732,6 +816,15 @@ namespace TileBoard
             _ui.BackOpacity = Math.Clamp(e.NewValue / 100.0, 0.15, 1.0);
             UpdateAppearanceLabels();
             ApplyAppearance(new WindowInteropHelper(this).Handle);
+            QueueSettingsSave();
+        }
+
+        private void InertiaSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
+        {
+            if (!_appearanceReady) return;
+
+            _ui.ScrollInertia = Math.Clamp(e.NewValue, 0, 100);
+            UpdateAppearanceLabels();
             QueueSettingsSave();
         }
 
@@ -1169,6 +1262,14 @@ namespace TileBoard
             string menuShot = GetArg("--menushot");
             if (menuShot != null) { await CaptureMenuShot(menuShot); return; }
 
+            // 调试/验收用：--colorshot <png> 展开「磁贴颜色」子菜单后抓屏（色板 + RGB 滑块）
+            string colorShot = GetArg("--colorshot");
+            if (colorShot != null) { await CaptureColorShot(colorShot); return; }
+
+            // 调试/验收用：--shotsnap <png> 拖一块磁贴悬在另一组上方，看圆形吸附网格与落点高亮
+            string snapShot = GetArg("--shotsnap");
+            if (snapShot != null) { await CaptureSnapShot(snapShot); return; }
+
             // 调试/验收用：--shotphone <png> 打开手机连接面板后截图
             string phoneShot = GetArg("--shotphone");
             if (phoneShot != null)
@@ -1259,8 +1360,7 @@ namespace TileBoard
                 lines.Add("磁贴应用数 = " + aumids.Count);
 
                 foreach (var (aumid, name) in aumids)
-                {
-                    var s32 = _catalog.GetIcon(aumid, 32);
+                {                    var s32 = _catalog.GetIcon(aumid, 32);
                     var s256 = _catalog.GetIcon(aumid, 256);
 
                     string fmt(BitmapSource b) => b == null
@@ -1300,6 +1400,36 @@ namespace TileBoard
 
                     lines.Add($"{(s32 == null ? "缺32" : "  32")}  {(s256 == null ? "缺256" : " 256")}  " +
                               $"32={fmt(s32)}  256={fmt(s256)}{content}{err}  {name}  [{aumid}]");
+                }
+
+                // —— 全目录扫描：应用库里每个应用的图标状态（白页问题的排查面） ——
+                lines.Add("");
+                lines.Add("===== 全目录扫描 =====");
+
+                foreach (var app in _catalog.All)
+                {
+                    var s32 = _catalog.GetIcon(app.Aumid, 32);
+
+                    string content = "";
+                    if (s32 != null)
+                    {
+                        (double cov, string box) = MeasureContent(s32);
+                        content = $"  覆盖={cov:0.00} 盒={box}";
+
+                        if (cov < 0.35 && iconDumpDir != null)
+                        {
+                            System.IO.Directory.CreateDirectory(iconDumpDir);
+                            string safe = string.Concat(("cat-" + app.Name)
+                                .Where(ch => !System.IO.Path.GetInvalidFileNameChars().Contains(ch)));
+                            var enc = new PngBitmapEncoder();
+                            enc.Frames.Add(BitmapFrame.Create(s32));
+                            using var fs = System.IO.File.Create(
+                                System.IO.Path.Combine(iconDumpDir, safe + ".png"));
+                            enc.Save(fs);
+                        }
+                    }
+
+                    lines.Add($"{(s32 == null ? "无" : "有")} {content}  {app.Name}  [{app.Aumid}]");
                 }
             }
             catch (Exception ex)
@@ -2336,6 +2466,107 @@ namespace TileBoard
         }
 
         /// <summary>
+        /// 调色子菜单长什么样：色板 4×3 + RGB 三条滑块。同样是抓屏 ——
+        /// 子菜单也住在 Popup 里，离线渲染抓不到。
+        /// </summary>
+        private async Task CaptureColorShot(string path)
+        {
+            await Task.Delay(1500);
+
+            ShowBoard();
+            await Task.Delay(700);
+
+            var group = _layout?.Groups.FirstOrDefault(g => g != null && g.Tiles.Count > 0);
+            var tile = group?.Tiles.FirstOrDefault();
+
+            if (tile == null)
+            {
+                System.IO.File.WriteAllText(path + ".txt", "板面上没有磁贴");
+                Application.Current.Shutdown();
+                return;
+            }
+
+            var menu = BuildTileMenu(tile, group);
+            menu.Placement = PlacementMode.AbsolutePoint;
+            menu.HorizontalOffset = 360;
+            menu.VerticalOffset = 90;
+            menu.IsOpen = true;
+            await Task.Delay(700);
+
+            var colorItem = menu.Items.OfType<MenuItem>()
+                .FirstOrDefault(mi => mi.Header is string s && s == "磁贴颜色");
+
+            if (colorItem == null)
+            {
+                System.IO.File.WriteAllText(path + ".txt", "菜单里没找到「磁贴颜色」");
+                Application.Current.Shutdown();
+                return;
+            }
+
+            var origin = menu.PointToScreen(new Point(0, 0));
+            colorItem.IsSubmenuOpen = true;
+            await Task.Delay(1000);
+
+            // 子菜单住在自己的 Popup 里：找到它，按它的实际矩形抓屏
+            Popup subPopup = FindDescendantPopup(colorItem);
+            LogHookState2(subPopup == null
+                ? "colorshot submenu open but popup not found"
+                : $"colorshot popup child={subPopup.Child?.GetType().Name} " +
+                  $"w={(subPopup.Child as FrameworkElement)?.ActualWidth:0} " +
+                  $"h={(subPopup.Child as FrameworkElement)?.ActualHeight:0}");
+
+            int x, y, w, h;
+            if (subPopup?.Child is FrameworkElement fe && fe.ActualWidth > 0)
+            {
+                var po = fe.PointToScreen(new Point(0, 0));
+                x = (int)Math.Max(0, po.X - 10);
+                y = (int)Math.Max(0, po.Y - 10);
+                w = (int)Math.Min(2400, fe.ActualWidth + 20);
+                h = (int)Math.Min(1400, fe.ActualHeight + 20);
+            }
+            else
+            {
+                // 兜底：父菜单右侧一大块
+                x = (int)Math.Max(0, origin.X - 10);
+                y = (int)Math.Max(0, origin.Y - 10);
+                w = (int)Math.Min(2400, menu.ActualWidth + 900);
+                h = (int)Math.Min(1200, 780);
+            }
+
+            var shot = Native.ScreenCapture.Grab(x, y, w, h);
+            if (shot != null)
+            {
+                var encoder = new PngBitmapEncoder();
+                encoder.Frames.Add(BitmapFrame.Create(shot));
+                using (var fs = System.IO.File.Create(path))
+                    encoder.Save(fs);
+            }
+
+            colorItem.IsSubmenuOpen = false;
+            menu.IsOpen = false;
+            await Task.Delay(200);
+
+            Application.Current.Shutdown();
+        }
+
+        /// <summary>深搜视觉树找 MenuItem 子菜单的 Popup（只有展开后才有）。</summary>
+        private static Popup FindDescendantPopup(DependencyObject node)
+        {
+            if (node == null) return null;
+
+            int n = VisualTreeHelper.GetChildrenCount(node);
+            for (int j = 0; j < n; j++)
+            {
+                var child = VisualTreeHelper.GetChild(node, j);
+                if (child is Popup p) return p;
+
+                var found = FindDescendantPopup(child);
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        /// <summary>
         /// 淡入淡出自检：唤出后按时间采样根容器的实际透明度。
         /// 曲线应该是「从 0 平滑升到 1」，而不是一直 1（没动画）或先 1 再归零（先闪一帧）。
         /// </summary>
@@ -2995,6 +3226,42 @@ namespace TileBoard
         }
 
         /// <summary>
+        /// 截图用：拖一块磁贴悬在另一组上方，把圆形吸附网格、落点高亮和跟随影像一起拍下来。
+        /// </summary>
+        private async Task CaptureSnapShot(string path)
+        {
+            await Task.Delay(1800);
+
+            var source = _layout?.Groups.FirstOrDefault(g => g.Tiles.Count >= 3);
+            var target = _layout?.Groups.FirstOrDefault(g => !ReferenceEquals(g, source) && g.Tiles.Count >= 2);
+
+            if (source != null && target != null)
+            {
+                var tile = source.Tiles[0];
+                _dragItem = tile;
+                _dragGroup = source;
+                _dragBorder = FindTileBorder(tile);
+
+                if (_dragBorder != null)
+                {
+                    _mouseDown = true;
+                    StartDrag(_dragBorder.TranslatePoint(new Point(20, 20), this));
+
+                    // 停在目标组靠中间的位置：这里既该出网格，也该出落点格高亮
+                    Rect box = GroupGrid.Box(target);
+                    Point host = GroupsHost.TranslatePoint(new Point(0, 0), this);
+                    UpdateDrag(new Point(host.X + box.X + box.Width / 2,
+                                          host.Y + box.Y + GroupGrid.HeaderHeight + box.Height / 2));
+                }
+            }
+
+            await Task.Delay(250);
+            RevealForCapture();
+            SaveRootPng(path);
+            Application.Current.Shutdown();
+        }
+
+        /// <summary>
         /// 截图用：模拟把一块磁贴拖到组外，停在「松手就新建分组」的位置，
         /// 把跟随影像和虚线框一起拍下来。
         /// </summary>
@@ -3172,6 +3439,8 @@ namespace TileBoard
         /// </summary>
         private void ShowBoard()
         {
+            LogHookState2($"ShowBoard enter visible={IsVisible} hiding={_hiding}");
+
             if (IsVisible && !_hiding) return;
 
             _hiding = false;
@@ -3338,6 +3607,8 @@ namespace TileBoard
 
         private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
         {
+            LogHookState2("Closing fired —— 主窗口正在关闭");
+
             UnregisterHotKey(new WindowInteropHelper(this).Handle, HotkeyId);
             _hookWatch?.Dispose();
             _hookWatch = null;
@@ -3494,12 +3765,18 @@ namespace TileBoard
         {
             // 组块的尺寸由内容自然决定（标题 + 组内网格），位置交给 GroupCanvas，
             // 所以这里不设 Width / Margin —— 那是 WrapPanel 时代的写法
+            //
+            // 背景是主人的自定义色（#RRGGBB + 浓度），没设过 BgColor 就保持透明 ——
+            // 没有底色的面板收不到命中测试，空隙会直接穿到板面，所以透明底不能省
+            Brush blockBack = Brushes.Transparent;
+            if (TryParseColor(group.BgColor, out Color gbg))
+                blockBack = FrozenWithAlpha(gbg, group.BgOpacity > 0 ? group.BgOpacity : 0.35);
+
             var block = new StackPanel
             {
                 Tag = group,
-                // 整块可抓：只给标题行留抓手的时代，组一大就找不到能拖的地方了。
-                // 透明底是必须的 —— 没有底色的面板收不到命中测试，空隙会直接穿到板面
-                Background = Brushes.Transparent,
+                // 整块可抓：只给标题行留抓手的时代，组一大就找不到能拖的地方了
+                Background = blockBack,
                 Cursor = Cursors.SizeAll,
 
                 // 折叠之后组里一块磁贴都不建，面板宽度会塌成 0，标题行跟着缩到文字那么宽，
@@ -3513,6 +3790,17 @@ namespace TileBoard
                 if (e.ChangedButton != MouseButton.Left) return;
                 _groupHeaderCandidate = false;   // 按在组内空隙上，不参与双击改名
                 BeginGroupDragCandidate(group, block, e);
+            };
+
+            // 磁贴的右键被它们自己 handled 了，能冒到组块上的右键 = 标题行和组内空隙，
+            // 弹的正是分组自己的菜单（背景颜色/浓度/重命名都在那）
+            block.MouseRightButtonUp += (s, e) =>
+            {
+                var menu = BuildGroupMenu(group);
+                menu.PlacementTarget = block;
+                menu.Placement = PlacementMode.MousePoint;
+                menu.IsOpen = true;
+                e.Handled = true;
             };
 
             // Win10 的分组标题是纯文字，没有底板；比磁贴名称更暗一档
@@ -3675,19 +3963,125 @@ namespace TileBoard
 
         private static Brush Freeze(Brush b) { b.Freeze(); return b; }
 
+        // ================= 磁贴/分组个性化：颜色与图片的小工具 =================
+
+        /// <summary>把 JSON 里的颜色字符串（#RRGGBB / #AARRGGBB）解析回 Color。格式不对或为空返回 false。</summary>
+        private static bool TryParseColor(string hex, out Color c)
+        {
+            c = default;
+            if (string.IsNullOrWhiteSpace(hex)) return false;
+
+            string s = hex.Trim().TrimStart('#');
+            if (s.Length != 6 && s.Length != 8) return false;
+
+            try
+            {
+                byte a = 255, r, g, b;
+                if (s.Length == 8) a = Convert.ToByte(s.Substring(0, 2), 16);
+                r = Convert.ToByte(s.Substring(s.Length - 6, 2), 16);
+                g = Convert.ToByte(s.Substring(s.Length - 4, 2), 16);
+                b = Convert.ToByte(s.Substring(s.Length - 2, 2), 16);
+                c = Color.FromArgb(a, r, g, b);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>存 JSON 用：#RRGGBB（丢弃 alpha，透明度单独走浓度字段）。</summary>
+        private static string ColorToHex(Color c) =>
+            $"#{c.R:X2}{c.G:X2}{c.B:X2}";
+
+        /// <summary>两色线性插值，做悬停提亮用。</summary>
+        private static Color Blend(Color a, Color b, double t) => Color.FromRgb(
+            (byte)Math.Round(a.R + (b.R - a.R) * t),
+            (byte)Math.Round(a.G + (b.G - a.G) * t),
+            (byte)Math.Round(a.B + (b.B - a.B) * t));
+
+        /// <summary>按给定 alpha 冻结一块纯色刷子。</summary>
+        private static Brush FrozenWithAlpha(Color c, double alpha)
+        {
+            var b = new SolidColorBrush(Color.FromArgb(
+                (byte)Math.Round(Math.Clamp(alpha, 0, 1) * 255), c.R, c.G, c.B));
+            b.Freeze();
+            return b;
+        }
+
+        /// <summary>自定义图片的解码缓存：RenderAll 频繁重建视觉树，同一张图不反复读盘解码。</summary>
+        private static readonly Dictionary<string, BitmapSource> _userImageCache =
+            new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>读主人自己给的图片（png/jpg/bmp/ico…）。OnLoad 模式读完即释放文件句柄，坏文件返回 null。</summary>
+        private static BitmapSource LoadUserImage(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path) || !System.IO.File.Exists(path)) return null;
+            if (_userImageCache.TryGetValue(path, out var cached)) return cached;
+
+            try
+            {
+                var bmp = new System.Windows.Media.Imaging.BitmapImage();
+                bmp.BeginInit();
+                bmp.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                bmp.UriSource = new Uri(path);
+                bmp.EndInit();
+                bmp.Freeze();
+                _userImageCache[path] = bmp;
+                return bmp;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>磁贴悬停提示。空白磁贴要说明它现在的状态（观赏 / 启动目标）。</summary>
+        private static string TileTooltip(TileItem tile)
+        {
+            if (tile.IsBlank)
+            {
+                string head = string.IsNullOrWhiteSpace(tile.Name) ? "空白磁贴" : tile.Name;
+                return string.IsNullOrWhiteSpace(tile.Aumid)
+                    ? head + "\n空白磁贴：右键可设置图片、颜色或启动目标"
+                    : head + "\n启动：" + tile.Aumid;
+            }
+            return tile.Name + "\n" + tile.Aumid;
+        }
+
+        /// <summary>菜单标题栏与状态提示里用的磁贴名。空白没起名的叫「空白磁贴」，别显示一行空。</summary>
+        private static string DisplayTileName(TileItem tile) =>
+            string.IsNullOrWhiteSpace(tile.Name)
+                ? (tile.IsBlank ? "空白磁贴" : "(未命名)")
+                : tile.Name;
+
         private UIElement CreateTile(TileGroup group, TileItem tile)
         {
             int spanX = TileMetrics.SpanX(tile.Size);
             int spanY = TileMetrics.SpanY(tile.Size);
 
+            // 底色：主人自定义的颜色优先，没设才用 Win10 默认灰。
+            // 悬停色跟着自定义色走 —— 提亮一档，不然深色磁贴悬停时看不出反应
+            Brush back = TileBack;
+            Brush hoverBack = TileBackHover;
+            if (TryParseColor(tile.CustomColor, out Color custom))
+            {
+                back = Freeze(new SolidColorBrush(custom));
+                hoverBack = Freeze(new SolidColorBrush(Blend(custom, Colors.White, 0.12)));
+            }
+
+            // 磁贴整体透明度。<=0 是旧布局没写过这个字段的记号，按不透明算
+            double opacity = tile.TileOpacity <= 0 ? 1.0 : Math.Clamp(tile.TileOpacity, 0.15, 1.0);
+
+            // 纯观赏的空白磁贴点了没反应，光标就不该是手
+            bool launchable = !tile.IsBlank || !string.IsNullOrWhiteSpace(tile.Aumid);
+
             var border = new Border
             {
                 Width = TileMetrics.Pixels(spanX),
                 Height = TileMetrics.Pixels(spanY),
-                Background = TileBack,
-                Cursor = Cursors.Hand,
+                Background = back,
+                Opacity = opacity,
+                Cursor = launchable ? Cursors.Hand : Cursors.Arrow,
                 Tag = tile,
-                ToolTip = tile.Name + "\n" + tile.Aumid,
+                ToolTip = TileTooltip(tile),
                 SnapsToDevicePixels = true
             };
             TileGroupPanel.SetSpanX(border, spanX);
@@ -3702,12 +4096,12 @@ namespace TileBoard
             border.MouseEnter += (s, e) =>
             {
                 hover.Opacity = 1;
-                border.Background = TileBackHover;
+                border.Background = hoverBack;
             };
             border.MouseLeave += (s, e) =>
             {
                 hover.Opacity = 0;
-                border.Background = TileBack;
+                border.Background = back;
             };
 
             border.MouseLeftButtonDown += Tile_MouseLeftButtonDown;
@@ -3727,13 +4121,34 @@ namespace TileBoard
                 TileSize.Medium => 48,
                 TileSize.Wide => 44,
                 TileSize.Large => 96,
+                TileSize.ExtraLarge => 156,
                 _ => 48
             };
 
-            var bmp = _catalog.GetIcon(tile.Aumid, 256);
-            FrameworkElement visual;
+            // 图标来源三级：主人给的自定义图片 → 系统图标链（非空白磁贴）→ 什么都没有
+            bool hasCustom = !string.IsNullOrWhiteSpace(tile.CustomIconPath);
+            BitmapSource bmp = hasCustom
+                ? LoadUserImage(tile.CustomIconPath)
+                : (tile.IsBlank ? null : _catalog.GetIcon(tile.Aumid, 256));
 
-            if (bmp != null)
+            FrameworkElement visual = null;
+
+            if (bmp != null && hasCustom)
+            {
+                // 自定义图片铺满整块磁贴：Uniform 只缩不裁，比例不符时居中留边，
+                // 磁贴多大图就能撑多大 —— 这是「把它当画布」的用法，不是图标展示
+                visual = new Image
+                {
+                    Source = bmp,
+                    Width = TileMetrics.Pixels(spanX),
+                    Height = TileMetrics.Pixels(spanY),
+                    Stretch = Stretch.Uniform,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                RenderOptions.SetBitmapScalingMode(visual, BitmapScalingMode.HighQuality);
+            }
+            else if (bmp != null)
             {
                 visual = new Image
                 {
@@ -3746,7 +4161,7 @@ namespace TileBoard
                 };
                 RenderOptions.SetBitmapScalingMode(visual, BitmapScalingMode.HighQuality);
             }
-            else
+            else if (!tile.IsBlank)
             {
                 // 本机没有这个应用：画个字母占位，别让它变成空白方块
                 visual = new TextBlock
@@ -3759,16 +4174,21 @@ namespace TileBoard
                     VerticalAlignment = VerticalAlignment.Center
                 };
             }
+            // 空白磁贴没图也没字母：一块色板就是它的全部，这才是「占位」该有的样子
 
-            if (tile.Size == TileSize.Wide)
+            if (visual != null)
             {
-                visual.HorizontalAlignment = HorizontalAlignment.Left;
-                visual.Margin = new Thickness(18, 0, 0, 0);
+                // 系统图标在宽磁贴上维持 Win10 的「靠左居中」节奏；自定义图片不受它管
+                if (tile.Size == TileSize.Wide && !hasCustom)
+                {
+                    visual.HorizontalAlignment = HorizontalAlignment.Left;
+                    visual.Margin = new Thickness(18, 0, 0, 0);
+                }
+
+                grid.Children.Add(visual);
             }
 
-            grid.Children.Add(visual);
-
-            if (tile.Size != TileSize.Small)
+            if (tile.Size != TileSize.Small && !string.IsNullOrEmpty(tile.Name))
             {
                 var name = new TextBlock
                 {
@@ -3913,7 +4333,9 @@ namespace TileBoard
             _dragItem = null;
             _dragGroup = null;
 
-            if (item != null) Launch(item.Aumid);
+            // 空白磁贴没绑启动目标 = 纯观赏，单击就是单击，什么都不发生
+            if (item != null && !(item.IsBlank && string.IsNullOrWhiteSpace(item.Aumid)))
+                Launch(item.Aumid);
         }
 
         private void StartDrag(Point p)
@@ -4592,6 +5014,9 @@ namespace TileBoard
         private void BoardSurface_MouseRightButtonUp(object sender, MouseButtonEventArgs e)
         {
             // 磁贴和分组标题都把自己那次右键 handled 了，能冒到这里的都是空白
+            // 落点先记账：菜单项点击是异步的，那时候再问鼠标在哪已经晚了
+            _contextBoardPoint = e.GetPosition(GroupsHost);
+
             var menu = BuildBoardMenu();
 
             menu.PlacementTarget = BoardSurface;
@@ -4607,6 +5032,10 @@ namespace TileBoard
             var newGroup = new MenuItem { Header = "新建分组", Icon = MenuIcon("\uE710") };
             newGroup.Click += (s, ev) => AddGroup_Click(this, null);
             menu.Items.Add(newGroup);
+
+            var blank = new MenuItem { Header = "新建空白磁贴", Icon = MenuIcon("\uE712") };
+            blank.Click += (s, ev) => AddBlankTile();
+            menu.Items.Add(blank);
 
             var appearance = new MenuItem { Header = "个性化设置…", Icon = MenuIcon("\uE790") };
             appearance.Click += (s, ev) => ShowSettingsPage();
@@ -4657,13 +5086,16 @@ namespace TileBoard
             if (_layout == null) _layout = LayoutStore.CreateEmpty();
 
             var target = into;
-            if (target == null || !_layout.Groups.Contains(target))
-                target = _layout.Groups.FirstOrDefault(g => g != null);
+            bool freshGroup = false;
 
-            if (target == null)
+            // 没指定去处（资源管理器右键「固定到磁贴板」、--pin）：新开一个组。
+            // 这些入口的鼠标都压在别的窗口上，板面落点无从谈起；
+            // 与其拿 Groups[0] 猜一个 —— 那个组永远是 CreateEmpty 种下的「常用」，
+            // 于是所有固定动作都堆进它 —— 不如开个新组，摆到哪儿由主人自己决定。
+            if (target == null || !_layout.Groups.Contains(target))
             {
-                target = new TileGroup { Name = "固定" };
-                _layout.Groups.Add(target);
+                target = new TileGroup();
+                freshGroup = true;
             }
 
             int added = 0, skipped = 0;
@@ -4689,28 +5121,61 @@ namespace TileBoard
 
             if (added == 0)
             {
+                // 新组建了还没进板面，这项直接丢掉，不留空组
                 SetStatus(skipped > 0 ? "这些已经在磁贴板上了" : "没有选中任何东西");
                 return;
             }
+
+            if (freshGroup) _layout.Groups.Add(target);
 
             Save();
             RenderAll();
 
             SetStatus(skipped > 0
                 ? $"已固定 {added} 项，{skipped} 项已存在"
-                : $"已固定 {added} 项到「{target.Name}」");
+                : freshGroup
+                    ? $"已固定 {added} 项，新开了一组"
+                    : $"已固定 {added} 项到「{target.Name}」");
         }
 
         private ContextMenu BuildTileMenu(TileItem tile, TileGroup group)
         {
             var menu = MakeMenu();
 
-            menu.Items.Add(new MenuItem { Header = tile.Name, IsEnabled = false });
+            menu.Items.Add(new MenuItem { Header = DisplayTileName(tile), IsEnabled = false });
             menu.Items.Add(new Separator());
 
-            var open = new MenuItem { Header = "打开", Icon = MenuIcon("\uE768") };
-            open.Click += (s, e) => Launch(tile.Aumid);
-            menu.Items.Add(open);
+            bool launchable = !tile.IsBlank || !string.IsNullOrWhiteSpace(tile.Aumid);
+
+            if (launchable)
+            {
+                var open = new MenuItem { Header = "打开", Icon = MenuIcon("\uE768") };
+                open.Click += (s, e) => Launch(tile.Aumid);
+                menu.Items.Add(open);
+            }
+            else
+            {
+                // 纯观赏的空白磁贴：把「给它找点事做」的路数摆在最上面
+                var setTarget = new MenuItem { Header = "设置启动目标…", Icon = MenuIcon("\uE768") };
+                setTarget.Click += (s, e) => PickTileTarget(tile);
+                menu.Items.Add(setTarget);
+
+                var rename = new MenuItem { Header = "重命名…", Icon = MenuIcon("\uE8AC") };
+                rename.Click += (s, e) => BeginRenameTile(tile);
+                menu.Items.Add(rename);
+            }
+
+            if (tile.IsBlank && !string.IsNullOrWhiteSpace(tile.Aumid))
+            {
+                var clearTarget = new MenuItem { Header = "清除启动目标（变纯观赏）", Icon = MenuIcon("\uE74D") };
+                clearTarget.Click += (s, e) =>
+                {
+                    tile.Aumid = null;
+                    Save();
+                    RenderAll();
+                };
+                menu.Items.Add(clearTarget);
+            }
 
             menu.Items.Add(new Separator());
 
@@ -4734,6 +5199,47 @@ namespace TileBoard
                 resize.Items.Add(mi);
             }
             menu.Items.Add(resize);
+
+            // ===== 个性化：自定义图片、底色、透明度。每项都带「恢复默认」的退路 =====
+            var pickIcon = new MenuItem
+            {
+                Header = tile.IsBlank ? "设置图片…" : "自定义图标…",
+                Icon = MenuIcon("\uE8EB")
+            };
+            pickIcon.Click += (s, e) => PickTileIcon(tile);
+            menu.Items.Add(pickIcon);
+
+            if (!string.IsNullOrWhiteSpace(tile.CustomIconPath))
+            {
+                var resetIcon = new MenuItem { Header = "恢复默认图标" };
+                resetIcon.Click += (s, e) => { tile.CustomIconPath = null; Save(); RenderAll(); };
+                menu.Items.Add(resetIcon);
+            }
+
+            menu.Items.Add(MakeColorMenuItem(
+                "磁贴颜色", tile.CustomColor,
+                // 拖动滑块时只改这一块的底色，不重建整板
+                hex =>
+                {
+                    tile.CustomColor = hex;
+                    var b = FindTileBorder(tile);
+                    if (b != null && TryParseColor(hex, out Color cc))
+                        b.Background = Freeze(new SolidColorBrush(cc));
+                },
+                () => { Save(); RenderAll(); },
+                "恢复默认颜色",
+                () => { tile.CustomColor = null; Save(); RenderAll(); }));
+
+            menu.Items.Add(MakeOpacityMenuItem(
+                "透明度", tile.TileOpacity <= 0 ? 1.0 : tile.TileOpacity,
+                v =>
+                {
+                    tile.TileOpacity = v;
+                    // 拖动时实时改挂在树上的那块磁贴，松手才写盘 —— 别让滑块每走一格就序列化一遍
+                    var b = FindTileBorder(tile);
+                    if (b != null) b.Opacity = Math.Clamp(v, 0.15, 1.0);
+                },
+                Save));
 
             var moveMenu = new MenuItem { Header = "移到分组", Icon = MenuIcon("\uE838") };
             if (_layout != null)
@@ -4771,27 +5277,32 @@ namespace TileBoard
             };
             moveMenu.Items.Add(newGroupItem);
 
-            // Win10 原版布局：三个应用级动作收进「更多」子菜单（顺序同 Win10：
-            // 固定到任务栏 → 以管理员身份运行 → 打开文件位置），卸载独占一级项
-            var moreMenu = new MenuItem { Header = "更多", Icon = MenuIcon("\uE712") };
+            // 应用级动作（任务栏/管理员/文件位置/卸载）只对能启动的磁贴有意义，
+            // 纯观赏的空白磁贴没有目标可定位，整段不摆
+            if (launchable)
+            {
+                // Win10 原版布局：三个应用级动作收进「更多」子菜单（顺序同 Win10：
+                // 固定到任务栏 → 以管理员身份运行 → 打开文件位置），卸载独占一级项
+                var moreMenu = new MenuItem { Header = "更多", Icon = MenuIcon("\uE712") };
 
-            var pinTaskbar = new MenuItem { Header = "添加到任务栏", Icon = MenuIcon("\uE718") };
-            pinTaskbar.Click += (s, e) => PinToTaskbarFor(tile);
-            moreMenu.Items.Add(pinTaskbar);
+                var pinTaskbar = new MenuItem { Header = "添加到任务栏", Icon = MenuIcon("\uE718") };
+                pinTaskbar.Click += (s, e) => PinToTaskbarFor(tile);
+                moreMenu.Items.Add(pinTaskbar);
 
-            var runAdmin = new MenuItem { Header = "管理员身份打开", Icon = MenuIcon("\uE7EF") };
-            runAdmin.Click += (s, e) => RunAsAdminFor(tile);
-            moreMenu.Items.Add(runAdmin);
+                var runAdmin = new MenuItem { Header = "管理员身份打开", Icon = MenuIcon("\uE7EF") };
+                runAdmin.Click += (s, e) => RunAsAdminFor(tile);
+                moreMenu.Items.Add(runAdmin);
 
-            var openLocation = new MenuItem { Header = "打开文件位置", Icon = MenuIcon("\uE8B7") };
-            openLocation.Click += (s, e) => OpenFileLocationFor(tile);
-            moreMenu.Items.Add(openLocation);
+                var openLocation = new MenuItem { Header = "打开文件位置", Icon = MenuIcon("\uE8B7") };
+                openLocation.Click += (s, e) => OpenFileLocationFor(tile);
+                moreMenu.Items.Add(openLocation);
 
-            menu.Items.Add(moreMenu);
+                menu.Items.Add(moreMenu);
 
-            var uninstall = new MenuItem { Header = "卸载", Icon = MenuIcon("\uE74D") };
-            uninstall.Click += (s, e) => UninstallFor(tile);
-            menu.Items.Add(uninstall);
+                var uninstall = new MenuItem { Header = "卸载", Icon = MenuIcon("\uE74D") };
+                uninstall.Click += (s, e) => UninstallFor(tile);
+                menu.Items.Add(uninstall);
+            }
 
             menu.Items.Add(new Separator());
             menu.Items.Add(moveMenu);
@@ -4814,6 +5325,348 @@ namespace TileBoard
             return menu;
         }
 
+        // ================= 个性化：选择器 / 滑块 / 空白磁贴 / 分组菜单 =================
+
+        /// <summary>
+        /// 菜单里的透明度滑块。WPF 的 MenuItem 摆得下任意控件 —— 一个滑块比四档
+        /// 「低/中/高」精确得多，拖动实时生效（apply），松手才落盘（commit）。
+        /// </summary>
+        private MenuItem MakeOpacityMenuItem(string label, double initial,
+                                             Action<double> apply, Action commit)
+        {
+            var slider = new Slider
+            {
+                Minimum = 0.15,
+                Maximum = 1.0,
+                Value = Math.Clamp(initial, 0.15, 1.0),
+                Width = 130,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Style = (Style)Application.Current.Resources["SettingSlider"]
+            };
+
+            var value = new TextBlock
+            {
+                Text = Math.Round(initial * 100) + "%",
+                Width = 34,
+                Foreground = new SolidColorBrush(Color.FromRgb(0x9A, 0x9A, 0x9A)),
+                FontSize = 11,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Left
+            };
+
+            slider.ValueChanged += (s, e) =>
+            {
+                value.Text = Math.Round(slider.Value * 100) + "%";
+                apply(slider.Value);
+            };
+
+            // 松开鼠标 = 这轮拖动结束，落盘。ValueChanged 一格一条事件，不能每条都写
+            slider.MouseLeftButtonUp += (s, e) => commit();
+            slider.LostMouseCapture += (s, e) => commit();
+
+            var grid = new Grid { Width = 190 };
+            grid.Children.Add(value);
+            grid.Children.Add(slider);
+
+            return new MenuItem { Header = grid };
+        }
+
+        /// <summary>
+        /// 菜单里的取色器 —— 参考主流取色器的样子：
+        /// 色轮转色相，轮心方框定饱和/明度，H/S/V 三条微调，下面一排样本色块。
+        ///
+        /// 弹窗的问题是流程：右键菜单要先收起来，对话框盖上来，选完再重开菜单，
+        /// 想比较第二、第三个颜色就再来一轮。取色器直接嵌进子菜单就没了这道折返：
+        /// 拖动即时生效，菜单不收，松手才落盘。
+        ///
+        /// apply 只改「眼睛看得见的那一层」，拖动时才不会每走一格就重建整块板；
+        /// commit 在松手 / 点样本 / 敲回车时调一次，负责落盘。
+        /// </summary>
+        private MenuItem MakeColorMenuItem(string label, string currentHex,
+                                           Action<string> apply, Action commit,
+                                           string resetLabel, Action reset)
+        {
+            var picker = new ColorPickerPanel(currentHex);
+            picker.ColorChanged += hex => apply(hex);
+            picker.Committed += () => commit();
+
+            var host = new MenuItem
+            {
+                Header = picker,
+                StaysOpenOnClick = true,
+                Height = double.NaN,      // 全局样式把菜单项钉死在 32px，不解开取色器会被裁掉
+                Tag = "PlainHost"         // 悬停高亮降级成淡灰（见 App.xaml 触发器）
+            };
+
+            var colorMenu = new MenuItem { Header = label, Icon = MenuIcon("\uE790") };
+            colorMenu.Items.Add(host);
+
+            // 恢复按钮常驻：没设过自定义色时它就是「回默认灰」的退路，点了对状态也无害
+            if (reset != null)
+            {
+                colorMenu.Items.Add(new Separator());
+
+                var resetItem = new MenuItem
+                {
+                    Header = string.IsNullOrWhiteSpace(resetLabel) ? "恢复默认" : resetLabel,
+                    Icon = MenuIcon("\uE74D")
+                };
+                resetItem.Click += (s, e) => reset();
+                colorMenu.Items.Add(resetItem);
+            }
+
+            return colorMenu;
+        }
+
+        /// <summary>选一张自定义图片当磁贴的整面画布。文件不拷贝不挪动，只记路径。</summary>
+        private void PickTileIcon(TileItem tile)
+        {
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "选择磁贴图片",
+                Filter = "图片 (*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.ico)|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.ico|所有文件 (*.*)|*.*"
+            };
+            if (dlg.ShowDialog(this) != true) return;
+
+            tile.CustomIconPath = dlg.FileName;
+            Save();
+            RenderAll();
+        }
+
+        /// <summary>给空白磁贴绑启动目标：任何文件都行，路径交给 shell 打开，和固定文件磁贴同一条链。</summary>
+        private void PickTileTarget(TileItem tile)
+        {
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "选择单击空白磁贴时要打开的东西",
+                Filter = "所有文件 (*.*)|*.*"
+            };
+            if (dlg.ShowDialog(this) != true) return;
+
+            tile.Aumid = dlg.FileName;
+            Save();
+            RenderAll();
+        }
+
+        /// <summary>空白磁贴的内联改名。原理与分组改名一致：把磁贴面换成输入框，提交后 RenderAll 还原。</summary>
+        private void BeginRenameTile(TileItem tile)
+        {
+            if (_renaming) return;
+            var border = FindTileBorder(tile);
+            if (border == null) return;
+
+            _renaming = true;
+            var original = border.Child;
+
+            var box = new TextBox
+            {
+                Text = tile.Name,
+                Background = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x33)),
+                Foreground = Brushes.White,
+                CaretBrush = Brushes.White,
+                BorderBrush = new SolidColorBrush(Color.FromRgb(0x7A, 0x7A, 0x7A)),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(3, 0, 3, 0),
+                FontSize = 12.5,
+                Margin = new Thickness(6, 0, 6, 0),
+                VerticalAlignment = VerticalAlignment.Center,
+                VerticalContentAlignment = VerticalAlignment.Center
+            };
+
+            border.Child = box;
+            box.Focus();
+            box.SelectAll();
+
+            bool committed = false;
+
+            void Commit()
+            {
+                if (committed) return;
+                committed = true;
+                tile.Name = string.IsNullOrWhiteSpace(box.Text) ? "" : box.Text.Trim();
+                _renaming = false;
+                Save();
+                RenderAll();
+            }
+
+            box.KeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Enter) { Commit(); e.Handled = true; }
+                else if (e.Key == Key.Escape)
+                {
+                    committed = true;
+                    _renaming = false;
+                    border.Child = original;
+                }
+            };
+            box.LostFocus += (s, e) => Commit();
+        }
+
+        /// <summary>分组右键菜单：重命名、折叠、背景颜色与浓度。</summary>
+        private ContextMenu BuildGroupMenu(TileGroup group)
+        {
+            var menu = MakeMenu();
+
+            menu.Items.Add(new MenuItem
+            {
+                Header = group.IsUnnamed ? TileGroup.DefaultName : group.Name,
+                IsEnabled = false
+            });
+            menu.Items.Add(new Separator());
+
+            var rename = new MenuItem { Header = "重命名…", Icon = MenuIcon("\uE8AC") };
+            rename.Click += (s, e) => BeginRenameGroup(group);
+            menu.Items.Add(rename);
+
+            var fold = new MenuItem
+            {
+                Header = group.Collapsed ? "展开分组" : "折叠分组",
+                Icon = MenuIcon(group.Collapsed ? "\uE8A0" : "\uE96E")
+            };
+            fold.Click += (s, e) => ToggleGroupCollapsed(group);
+            menu.Items.Add(fold);
+
+            menu.Items.Add(new Separator());
+
+            menu.Items.Add(MakeColorMenuItem(
+                "背景颜色", group.BgColor,
+                hex =>
+                {
+                    group.BgColor = hex;
+                    // 选了颜色却看不见等于没选：第一次上色顺手给个浓度
+                    if (group.BgOpacity <= 0) group.BgOpacity = 0.35;
+
+                    if (TryParseColor(hex, out Color gc) && FindGroupBlock(group) is Panel bp)
+                        bp.Background = FrozenWithAlpha(gc, group.BgOpacity);
+                },
+                () => { Save(); RenderAll(); },
+                "清除背景色",
+                () => { group.BgColor = null; group.BgOpacity = 0; Save(); RenderAll(); }));
+
+            if (!string.IsNullOrEmpty(group.BgColor))
+            {
+                var gColor = group.BgColor;
+                TryParseColor(gColor, out Color parsed);
+
+                menu.Items.Add(MakeOpacityMenuItem(
+                    "背景浓度", group.BgOpacity > 0 ? group.BgOpacity : 0.35,
+                    v =>
+                    {
+                        group.BgOpacity = v;
+                        // 实时改挂树上的组块底色，RenderAll 会把整组磁贴重建一遍，太重
+                        var block = FindGroupBlock(group);
+                        if (block is Panel bp) bp.Background = FrozenWithAlpha(parsed, v);
+                    },
+                    Save));
+
+                var clearBg = new MenuItem { Header = "清除背景", Icon = MenuIcon("\uE74D") };
+                clearBg.Click += (s, e) =>
+                {
+                    group.BgColor = null;
+                    group.BgOpacity = 0;
+                    Save();
+                    RenderAll();
+                };
+                menu.Items.Add(clearBg);
+            }
+
+            return menu;
+        }
+
+        /// <summary>
+        /// 新建一块空白磁贴：没有启动目标、没有名字，纯占位。
+        /// 位置跟着鼠标右键走 —— 点在哪个组里就插到那一格（占着的地方让开），
+        /// 点在组外空白就在落点开一个新组把它装进去。
+        /// </summary>
+        private void AddBlankTile()
+        {
+            if (_layout == null) _layout = LayoutStore.CreateEmpty();
+
+            var tile = new TileItem
+            {
+                Aumid = null,
+                Name = "",
+                Size = TileSize.Medium,
+                IsBlank = true
+            };
+
+            if (TryResolveSlotAt(_contextBoardPoint, tile.SpanX, tile.SpanY,
+                                 out TileGroup target, out int col, out int row))
+            {
+                // 组内：坐标直接钉在落点那一格，与它重叠的磁贴让位一次
+                tile.Column = col;
+                tile.Row = row;
+                target.Tiles.Add(tile);
+                TileGrid.Place(target, tile, col, row);
+            }
+            else
+            {
+                // 组外：和从应用库拖到空白处同一个规矩 —— 就地开一个组装下它
+                tile.Column = 0;
+                tile.Row = 0;
+
+                var group = _layout.Groups.Count == 0
+                    ? new TileGroup { Name = "常用" }
+                    : new TileGroup();
+                group.Tiles.Add(tile);
+
+                int cols = CurrentColumns();
+                int sc = Math.Min(tile.SpanX, TileMetrics.GridColumns);
+                int gcol = (int)Math.Round(Math.Max(0, _contextBoardPoint.X) / TileMetrics.Stride);
+                int grow = (int)Math.Round(Math.Max(0, _contextBoardPoint.Y) / TileMetrics.Stride);
+                group.Column = Math.Clamp(gcol, 0, Math.Max(0, cols - sc));
+                group.Row = Math.Max(0, grow);
+
+                _layout.Groups.Add(group);
+            }
+
+            Save();
+            RenderAll();
+            SetStatus("已新建空白磁贴：右键它可设置图片、颜色、启动目标");
+        }
+
+        /// <summary>
+        /// 板面坐标落在哪个组的哪一格。参数是 GroupsHost 局部坐标（和 GroupGrid.Box 同一套）。
+        ///
+        /// 与 TryResolveDrop 的分工：那个是拖动中的命中，要 _dragItem、抓取偏移、
+        /// 18px 捕捉余量，都是为手感服务的；这里是一次性的精确点击，
+        /// 所以命中区按组的真实矩形算 —— 余量放大会把「点组外空白」吞成「点进组里」。
+        /// </summary>
+        private bool TryResolveSlotAt(Point boardPt, int spanX, int spanY,
+                                      out TileGroup group, out int col, out int row)
+        {
+            group = null;
+            col = row = 0;
+            if (_layout == null) return false;
+
+            spanX = Math.Clamp(spanX, 1, TileMetrics.GridColumns);
+            spanY = Math.Max(1, spanY);
+
+            Rect box = Rect.Empty;
+            foreach (var g in _layout.Groups)
+            {
+                if (g == null) continue;
+                Rect b = GroupGrid.Box(g);
+                if (b.Contains(boardPt)) { group = g; box = b; break; }
+            }
+
+            if (group == null) return false;
+
+            // 新磁贴以鼠标点为中心长出来，才叫「在右键附近」；
+            // 拖动那套抓取偏移这里没有 —— 不跟手的是影像，不是鼠标
+            double left = boardPt.X - box.X - TileMetrics.Pixels(spanX) / 2.0;
+            double top = boardPt.Y - (box.Y + GroupGrid.HeaderHeight) - TileMetrics.Pixels(spanY) / 2.0;
+
+            col = (int)Math.Round(left / TileMetrics.Stride);
+            row = (int)Math.Round(top / TileMetrics.Stride);
+
+            col = Math.Clamp(col, 0, Math.Max(0, TileMetrics.GridColumns - spanX));
+            row = Math.Max(0, row);
+
+            return true;
+        }
+
         // ================= 磁贴右键动作：文件位置 / 任务栏 / 管理员 / 卸载 =================
 
         /// <summary>非路径 AUMID 在 AppsFolder 里的解析名。</summary>
@@ -4831,6 +5684,13 @@ namespace TileBoard
         /// 动词打头 —— AppsFolder 项的目标在哪系统自己最清楚，
         /// 自己扫 .lnk 既慢又会被无权限目录卡脖子，只配当兜底。
         /// </summary>
+        /// <summary>只拿 AUMID 调「打开文件位置」—— 应用库里的行还不是磁贴。</summary>
+        private void OpenFileLocationFor(string aumid)
+        {
+            if (string.IsNullOrWhiteSpace(aumid)) return;
+            OpenFileLocationFor(new TileItem { Aumid = aumid });
+        }
+
         private void OpenFileLocationFor(TileItem tile)
         {
             try
@@ -5504,6 +6364,11 @@ namespace TileBoard
             Text = glyph,
             FontFamily = new FontFamily("Segoe MDL2 Assets"),
             FontSize = 16,
+            // 图标字体的行盒比字形本身高，字形贴在行盒顶部 —— 不压住行高，
+            // 图标在 32px 的菜单行里就会整体偏高；顺便把字形在 44px 列里水平居中
+            LineHeight = 16,
+            LineStackingStrategy = LineStackingStrategy.BlockLineHeight,
+            HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Center
         };
 
@@ -5698,34 +6563,163 @@ namespace TileBoard
             var row = RowFromEvent(e);
             if (row == null) return;
 
-            // 应用库右键 = 磁贴右键同一套菜单。在板上的直接用板上那块（连分组一起）；
-            // 没上板的临时造一块 —— 这样「调整大小/移到分组」对新应用也成立，
-            // 移进某个分组就等于把它固定上板。
-            TileItem tile = null;
-            TileGroup group = null;
-            if (_layout?.Groups != null)
-            {
-                foreach (var g in _layout.Groups)
-                {
-                    var hit = g?.Tiles.FirstOrDefault(t => t != null &&
-                        string.Equals(t.Aumid, row.Aumid, StringComparison.OrdinalIgnoreCase));
-                    if (hit == null) continue;
-                    tile = hit;
-                    group = g;
-                    break;
-                }
-            }
-
-            if (tile == null)
-                tile = new TileItem { Aumid = row.Aumid, Name = row.Name, Size = TileSize.Medium };
-
-            var menu = BuildTileMenu(tile, group);
+            // 应用库有自己的菜单：这里问的是「上不上板」，不是「这块磁贴怎么调」。
+            // 以前直接复用磁贴菜单，未上板的应用会拿到「调整大小 / 自定义图标 /
+            // 颜色 / 透明度」—— 改的是一块临时 TileItem，不在任何组里，
+            // Save 存的是空气，点完毫无反应。要调外观，先把它放到板上。
+            var menu = BuildLibraryMenu(row);
 
             menu.PlacementTarget = AppsList;
             menu.Placement = PlacementMode.MousePoint;
             menu.IsOpen = true;
 
             e.Handled = true;
+        }
+
+        /// <summary>
+        /// 应用库右键菜单。只做三件事：把它放到板上、打开它、看它装在哪。
+        /// 磁贴级的外观调整全部留给板上那块 —— 那些操作对一块还不存在的磁贴没有意义。
+        /// </summary>
+        private ContextMenu BuildLibraryMenu(AppRow row)
+        {
+            var menu = MakeMenu();
+
+            menu.Items.Add(new MenuItem { Header = row.Name, IsEnabled = false });
+            menu.Items.Add(new Separator());
+
+            var owner = FindTileGroup(row.Aumid);
+
+            if (owner == null)
+            {
+                var add = new MenuItem { Header = "添加到磁贴板", Icon = MenuIcon("\uE710") };
+                add.Click += (s, e) => PinAumid(row.Aumid);
+                menu.Items.Add(add);
+
+                // 「放进哪个组」比「新开一组」常用得多，单开一级子菜单
+                var intoGroup = new MenuItem { Header = "添加到分组", Icon = MenuIcon("\uE8FD") };
+                if (_layout?.Groups != null && _layout.Groups.Count > 0)
+                {
+                    foreach (var g in _layout.Groups.ToList())
+                    {
+                        var target = g;
+                        var mi = new MenuItem { Header = GroupMenuName(g) };
+                        mi.Click += (s, e) => AddAumidToGroup(row.Aumid, target);
+                        intoGroup.Items.Add(mi);
+                    }
+                }
+                else
+                {
+                    intoGroup.IsEnabled = false;
+                }
+                menu.Items.Add(intoGroup);
+            }
+            else
+            {
+                menu.Items.Add(new MenuItem
+                {
+                    Header = "已在「" + GroupMenuName(owner) + "」",
+                    IsEnabled = false
+                });
+
+                var remove = new MenuItem { Header = "从磁贴板移除", Icon = MenuIcon("\uE77A") };
+                remove.Click += (s, e) => RemoveAumidFromBoard(row.Aumid);
+                menu.Items.Add(remove);
+            }
+
+            menu.Items.Add(new Separator());
+
+            var open = new MenuItem { Header = "打开", Icon = MenuIcon("\uE768") };
+            open.Click += (s, e) => Launch(row.Aumid);
+            menu.Items.Add(open);
+
+            var location = new MenuItem { Header = "打开文件位置", Icon = MenuIcon("\uE8B7") };
+            location.Click += (s, e) => OpenFileLocationFor(row.Aumid);
+            menu.Items.Add(location);
+
+            menu.Items.Add(new Separator());
+
+            var appearanceItem = new MenuItem { Header = "个性化设置…", Icon = MenuIcon("\uE790") };
+            appearanceItem.Click += (s, e) => ShowSettingsPage();
+            menu.Items.Add(appearanceItem);
+
+            return menu;
+        }
+
+        /// <summary>这个 AUMID 落在哪个组里；不在板上返回 null。</summary>
+        private TileGroup FindTileGroup(string aumid)
+        {
+            if (_layout?.Groups == null || string.IsNullOrWhiteSpace(aumid)) return null;
+
+            foreach (var g in _layout.Groups)
+            {
+                if (g?.Tiles == null) continue;
+                if (g.Tiles.Any(t => t != null &&
+                    string.Equals(t.Aumid, aumid, StringComparison.OrdinalIgnoreCase)))
+                    return g;
+            }
+            return null;
+        }
+
+        /// <summary>菜单里怎么称呼一个组：起过名的用名字，没起名的给个序号，总得能分开。</summary>
+        private string GroupMenuName(TileGroup g)
+        {
+            if (g == null) return "未分组";
+            if (!g.IsUnnamed && !string.IsNullOrWhiteSpace(g.Name)) return g.Name;
+
+            int index = _layout?.Groups?.IndexOf(g) ?? -1;
+            return index >= 0 ? $"未命名组 {index + 1}" : "未命名组";
+        }
+
+        /// <summary>把应用库里的一个应用直接放进指定分组。</summary>
+        private void AddAumidToGroup(string aumid, TileGroup group)
+        {
+            if (string.IsNullOrWhiteSpace(aumid) || group == null) return;
+            if (_layout == null || !_layout.Groups.Contains(group)) return;
+
+            if (IsOnBoard(aumid))
+            {
+                SetStatus("这个应用已经在板上了");
+                return;
+            }
+
+            group.Tiles.Add(new TileItem
+            {
+                Aumid = aumid,
+                Name = _catalog.ResolveName(aumid),
+                Size = TileSize.Medium
+            });
+
+            MarkPinned(aumid);
+
+            Save();
+            RenderAll();
+            SetStatus("已添加：" + _catalog.ResolveName(aumid) + "（" + GroupMenuName(group) + "）");
+        }
+
+        /// <summary>从磁贴板上摘掉一个应用（可能在多个组里各有一块）。</summary>
+        private void RemoveAumidFromBoard(string aumid)
+        {
+            if (_layout?.Groups == null || string.IsNullOrWhiteSpace(aumid)) return;
+
+            int removed = 0;
+            foreach (var g in _layout.Groups)
+            {
+                if (g?.Tiles == null) continue;
+                removed += g.Tiles.RemoveAll(t => t != null &&
+                    string.Equals(t.Aumid, aumid, StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (removed == 0)
+            {
+                SetStatus("板上没有这个应用");
+                return;
+            }
+
+            UnmarkPinned(aumid);
+
+            Save();
+            RenderAll();
+            SetStatus("已从磁贴板移除：" + _catalog.ResolveName(aumid));
         }
 
         /// <summary>
@@ -5868,7 +6862,30 @@ namespace TileBoard
             }
         }
 
-        /// <summary>右键菜单里的「固定到磁贴板」：塞进第一个分组。</summary>
+        /// <summary>从板上摘掉之后，把那一行「已在板上」的灰字撤回来。</summary>
+        private void UnmarkPinned(string aumid)
+        {
+            if (string.IsNullOrWhiteSpace(aumid)) return;
+            if (AppsList?.ItemsSource is not IEnumerable<AppRow> rows) return;
+
+            foreach (var row in rows)
+            {
+                if (row == null || row.IsHeader) continue;
+                if (!string.Equals(row.Aumid, aumid, StringComparison.OrdinalIgnoreCase)) continue;
+
+                row.IsPinned = false;
+                return;
+            }
+        }
+
+        /// <summary>
+        /// 右键菜单里的「固定到磁贴板」：新开一个组把它放进去。
+        ///
+        /// 以前是 `Groups[0].Tiles.Add(...)` —— 而第一个组永远是 CreateEmpty 种下的
+        /// 「常用」，于是从应用库固定的东西全堆在那一组里。固定动作发生在左边的列表上，
+        /// 鼠标跟板面没有关系，没有落点可用；与其猜一个已有组，不如开新的，
+        /// 并到哪个组去由主人自己拖。
+        /// </summary>
         private void PinAumid(string aumid)
         {
             if (string.IsNullOrWhiteSpace(aumid)) return;
@@ -5881,16 +6898,21 @@ namespace TileBoard
                 return;
             }
 
-            _layout.Groups[0].Tiles.Add(new TileItem
+            var group = new TileGroup();
+            group.Tiles.Add(new TileItem
             {
                 Aumid = aumid,
                 Name = _catalog.ResolveName(aumid),
                 Size = TileSize.Medium
             });
 
+            _layout.Groups.Add(group);
+
+            MarkPinned(aumid);
+
             Save();
             RenderAll();
-            SetStatus("已固定：" + _catalog.ResolveName(aumid));
+            SetStatus("已固定：" + _catalog.ResolveName(aumid) + "（新开一组）");
         }
 
         // ================= 生成 / 持久化 =================

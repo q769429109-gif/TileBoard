@@ -22,6 +22,9 @@ namespace TileBoard.Services
         /// <summary>是否启用亚克力模糊（系统 DWM）。显卡/远程桌面下若不合适可关掉，退回纯半透明。</summary>
         public bool Acrylic { get; set; } = true;
 
+        /// <summary>滚轮惯性 0 ~ 100。0 = 关（跟手停）；越大，滚轮停了之后板面继续滑得越远。</summary>
+        public double ScrollInertia { get; set; } = 45;
+
         private static readonly JsonSerializerOptions Options = new JsonSerializerOptions { WriteIndented = true };
 
         private static string FilePath => Path.Combine(LayoutStore.Directory, "settings.json");

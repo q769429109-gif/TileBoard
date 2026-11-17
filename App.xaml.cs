@@ -10,7 +10,20 @@ namespace TileBoard
         {
             // 一个没人管的异常不该让整块板子消失
             DispatcherUnhandledException += OnDispatcherException;
-            AppDomain.CurrentDomain.UnhandledException += (s, args) => { };
+
+            // 非 UI 线程的异常以前被一个空 lambda 吞掉 —— 进程一声不响地没了，
+            // 日志里连个照面都没有。至少把堆栈留下来。
+            AppDomain.CurrentDomain.UnhandledException += (s, args) =>
+            {
+                Log("UNHANDLED(" + (args.IsTerminating ? "terminate" : "continue") + "): " +
+                    args.ExceptionObject);
+            };
+
+            System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (s, args) =>
+            {
+                Log("UNOBSERVED TASK: " + args.Exception);
+                args.SetObserved();
+            };
 
             string[] args = Environment.GetCommandLineArgs();
 
@@ -63,6 +76,12 @@ namespace TileBoard
             }
 
             base.OnStartup(e);
+        }
+
+        protected override void OnExit(ExitEventArgs e)
+        {
+            Log("APP EXIT code=" + e.ApplicationExitCode + " (正常退出路径)");
+            base.OnExit(e);
         }
 
         /// <summary>
@@ -274,6 +293,10 @@ namespace TileBoard
         private void OnDispatcherException(object sender, DispatcherUnhandledExceptionEventArgs e)
         {
             e.Handled = true;
+
+            // 拦下归拦下，堆栈得留一份 —— 不然只剩"面板没了"这一个现象可查
+            Log("UI EXCEPTION: " + e.Exception);
+
             MessageBox.Show(
                 "磁贴板遇到一个问题，已拦下，面板继续运行。\n\n" + e.Exception.Message,
                 "磁贴板", MessageBoxButton.OK, MessageBoxImage.Warning);

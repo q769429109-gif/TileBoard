@@ -172,6 +172,17 @@
                         <TextBlock Text="开 = 系统 DWM 模糊（Win10 透明效果同款）；关 = 纯半透明。"
                                    FontSize="11" Foreground="#858585" Margin="0,4,0,0"/>
 
+                        <Grid Margin="0,16,0,0">
+                            <TextBlock Text="滚动惯性" FontSize="12.5" Foreground="#DCDCDC"/>
+                            <TextBlock x:Name="InertiaValue" Text="45" HorizontalAlignment="Right"
+                                       FontSize="12.5" Foreground="#9A9A9A"/>
+                        </Grid>
+                        <Slider x:Name="InertiaSlider" Minimum="0" Maximum="100" Value="45"
+                                Style="{StaticResource SettingSlider}"
+                                Margin="0,4,0,0" ValueChanged="InertiaSlider_ValueChanged"/>
+                        <TextBlock Text="滚轮停了之后板面继续滑的那段。0 = 关闭，滚到哪停哪；越大滑得越远。"
+                                   FontSize="11" Foreground="#858585" Margin="0,4,0,0"/>
+
                         <Border Height="1" Background="#1FFFFFFF" Margin="0,24,0,22"/>
 
                         <!-- ===== 尺寸 ===== -->

@@ -372,6 +372,15 @@
                                 <Setter TargetName="Bd" Property="Background" Value="#FF0078D7"/>
                                 <Setter TargetName="Bd" Property="TextElement.Foreground" Value="#FFFFFF"/>
                             </Trigger>
+                            <!-- Tag=PlainHost 的行是「装内容的托盘」（色板 / RGB 滑块），
+                                 不是可点的命令：悬停只给一层淡灰，别整块刷成强调蓝 -->
+                            <MultiTrigger>
+                                <MultiTrigger.Conditions>
+                                    <Condition Property="IsHighlighted" Value="True"/>
+                                    <Condition Property="Tag" Value="PlainHost"/>
+                                </MultiTrigger.Conditions>
+                                <Setter TargetName="Bd" Property="Background" Value="#FF333333"/>
+                            </MultiTrigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter TargetName="Bd" Property="TextElement.Foreground" Value="#7C7C7C"/>
                             </Trigger>

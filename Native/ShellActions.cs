@@ -684,6 +684,146 @@ namespace TileBoard.Native
         private static readonly Dictionary<string, string> _targetByNameCache =
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+        /// <summary>
+        /// 按应用名在开始菜单找同名快捷方式的「图标源」。
+        ///
+        /// 为什么单独立这一步：steam:// 协议项（Steam 游戏在 AppsFolder 的身份是
+        /// steam://rungameid/&lt;id&gt;）shell 只肯给「白页 + 小地球」的通用 URL 图标，
+        /// 而游戏的真封面藏在开始菜单 .url 快捷方式自带的 IconFile 键里 —— Explorer
+        /// 正是靠它给 Steam 游戏显示封面。.lnk 则读 IconLocation（游戏安装器写的）。
+        /// 匹配打分同 FindShortcutTargetByName：精确名 &gt; 前缀 &gt; 包含。
+        /// </summary>
+        public static string FindShortcutIconByName(string appName)
+        {
+            if (string.IsNullOrWhiteSpace(appName)) return null;
+
+            lock (_iconSourceByNameCache)
+            {
+                if (_iconSourceByNameCache.TryGetValue(appName, out var hit)) return hit;
+            }
+
+            string best = null;
+            int bestScore = int.MaxValue;
+
+            var roots = new List<string>
+            {
+                Environment.GetFolderPath(Environment.SpecialFolder.StartMenu),
+                Environment.GetFolderPath(Environment.SpecialFolder.CommonStartMenu)
+            };
+
+            foreach (var root in roots)
+            {
+                if (string.IsNullOrEmpty(root) || !System.IO.Directory.Exists(root)) continue;
+
+                var pending = new Queue<string>();
+                pending.Enqueue(root);
+
+                while (pending.Count > 0)
+                {
+                    string dir = pending.Dequeue();
+
+                    // .lnk 与 .url 一并扫：Steam 游戏写的是 .url
+                    foreach (string pattern in new[] { "*.lnk", "*.url" })
+                    {
+                        string[] files = null;
+                        try { files = System.IO.Directory.GetFiles(dir, pattern); }
+                        catch { /* 不可读，跳过 */ }
+
+                        if (files == null) continue;
+
+                        foreach (var file in files)
+                        {
+                            string stem = System.IO.Path.GetFileNameWithoutExtension(file);
+                            int score;
+                            if (string.Equals(stem, appName, StringComparison.OrdinalIgnoreCase))
+                                score = 0;
+                            else if (stem.StartsWith(appName, StringComparison.OrdinalIgnoreCase))
+                                score = 1;
+                            else if (stem.Contains(appName) ||
+                                     appName.IndexOf(stem, StringComparison.OrdinalIgnoreCase) >= 0)
+                                score = 2;
+                            else continue;
+
+                            if (score >= bestScore) continue;
+
+                            string iconPath = file.EndsWith(".url", StringComparison.OrdinalIgnoreCase)
+                                ? ReadUrlIconFile(file)
+                                : ReadShortcutIconLocation(file);
+
+                            if (string.IsNullOrEmpty(iconPath)) continue;
+                            iconPath = Environment.ExpandEnvironmentVariables(iconPath);
+                            if (!System.IO.File.Exists(iconPath)) continue;
+
+                            best = iconPath;
+                            bestScore = score;
+                        }
+                    }
+
+                    try
+                    {
+                        foreach (var sub in System.IO.Directory.EnumerateDirectories(dir))
+                            pending.Enqueue(sub);
+                    }
+                    catch { /* 跳过整层 */ }
+                }
+            }
+
+            lock (_iconSourceByNameCache) _iconSourceByNameCache[appName] = best;
+            return best;
+        }
+
+        private static readonly Dictionary<string, string> _iconSourceByNameCache =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>读 .lnk 的 IconLocation（图标文件路径；不含图标索引，调用方按整个文件提图）。</summary>
+        private static string ReadShortcutIconLocation(string lnkPath)
+        {
+            object linkObj = null;
+            try
+            {
+                Guid clsid = CLSID_ShellLink, iid = IID_IShellLinkW;
+                CoCreateInstance(ref clsid, IntPtr.Zero, 1, ref iid, out linkObj);
+
+                var persist = (System.Runtime.InteropServices.ComTypes.IPersistFile)linkObj;
+                persist.Load(lnkPath, 0x00000020);
+
+                var link = (IShellLinkW)linkObj;
+                var sb = new StringBuilder(520);
+                link.GetIconLocation(sb, sb.Capacity, out _);
+                return sb.ToString();
+            }
+            catch
+            {
+                return null;
+            }
+            finally
+            {
+                if (linkObj != null && Marshal.IsComObject(linkObj))
+                    Marshal.ReleaseComObject(linkObj);
+            }
+        }
+
+        /// <summary>
+        /// 读 .url 文本的 IconFile 键（INI 风格）。Steam 游戏的封面 ico / exe 路径就在这里。
+        /// </summary>
+        private static string ReadUrlIconFile(string urlPath)
+        {
+            try
+            {
+                foreach (string line in System.IO.File.ReadLines(urlPath))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+
+                    string key = line.Substring(0, eq).Trim();
+                    if (key.Equals("IconFile", StringComparison.OrdinalIgnoreCase))
+                        return line.Substring(eq + 1).Trim();
+                }
+            }
+            catch { /* 不可读 */ }
+            return null;
+        }
+
         /// <summary>诊断：对单个 .lnk 逐步骤读 AUMID/目标，异常全程不吞。</summary>
         public static string DiagProbeLnk(string lnkPath)
         {

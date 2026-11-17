@@ -96,6 +96,15 @@ namespace TileBoard.Services
         /// </summary>
         private BitmapSource ExtractIconChecked(string aumid, int pixels)
         {
+            // steam:// 协议项必须先走 Steam 自己的数据 —— shell 给它的「白页+地球」
+            // 通用 URL 图标覆盖率有 0.65，能混过质检线，但它是假的（Explorer 也是靠
+            // .url 的 IconFile 才显示封面的）。
+            if (aumid.StartsWith("steam://rungameid/", StringComparison.OrdinalIgnoreCase))
+            {
+                var steam = SteamGameIcon(aumid, pixels);
+                if (steam != null) return steam;
+            }
+
             IntPtr hbmp = NativeShell.GetAppImageHandle(aumid, pixels);
             BitmapSource bmp = ToBitmap(hbmp);
             NativeShell.FreeBitmap(hbmp);
@@ -108,6 +117,17 @@ namespace TileBoard.Services
             {
                 var packaged = ShellActions.GetPackagedAppIcon(aumid, pixels);
                 if (packaged != null) return packaged;
+            }
+
+            // 快捷方式自带的图标源：Steam 游戏封面藏在开始菜单 .url 的 IconFile 键里，
+            // 安装器生成的 .lnk 则写在 IconLocation —— 都比「目标 exe 的图标」更贴本尊
+            string iconSource = ShellActions.FindShortcutIconByName(ResolveName(aumid));
+            if (iconSource != null)
+            {
+                hbmp = NativeShell.GetAppImageHandle(iconSource, pixels);
+                var viaIconFile = ToBitmap(hbmp);
+                NativeShell.FreeBitmap(hbmp);
+                if (viaIconFile != null && OpaqueCoverage(viaIconFile) >= 0.35) return viaIconFile;
             }
 
             // 按名字找同名 lnk，对目标 exe 提 icon（Office C2R 这类）
@@ -140,6 +160,128 @@ namespace TileBoard.Services
                     BitmapSizeOptions.FromEmptyOptions());
                 bmp.Freeze();
                 return bmp;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static string _steamRoot;
+
+        /// <summary>Steam 安装根目录（HKCU\Software\Valve\Steam\SteamPath），找不到返回 null。</summary>
+        private static string SteamRoot()
+        {
+            if (_steamRoot != null) return _steamRoot;
+
+            try
+            {
+                using var k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam");
+                if (k?.GetValue("SteamPath") is string p && System.IO.Directory.Exists(p))
+                    _steamRoot = p;
+            }
+            catch { /* 没装 Steam */ }
+            return _steamRoot;
+        }
+
+        /// <summary>
+        /// 从 Steam 本地数据里捞游戏图标（steam://rungameid/&lt;appid&gt; 专用）。
+        /// 优先级：librarycache 方图（32px 原生，喂列表）→ 游戏本体 exe 的图标资源
+        /// （appmanifest 定位安装目录，喂磁贴）→ logo.png。全空返回 null。
+        /// </summary>
+        private BitmapSource SteamGameIcon(string aumid, int pixels)
+        {
+            string root = SteamRoot();
+            if (root == null) return null;
+
+            string appid = aumid.Substring("steam://rungameid/".Length).Trim();
+
+            try
+            {
+                string lcDir = System.IO.Path.Combine(root, "appcache", "librarycache", appid);
+
+                // 1) 小尺寸：librarycache 里那张 40 位十六进制名的方图（32x32 原生，最清晰）
+                if (pixels <= 48 && System.IO.Directory.Exists(lcDir))
+                {
+                    foreach (var f in System.IO.Directory.EnumerateFiles(lcDir, "*.jpg"))
+                    {
+                        string name = System.IO.Path.GetFileNameWithoutExtension(f);
+                        if (name.Length == 40 && IsHex(name))
+                            return LoadImageFile(f, pixels);
+                    }
+                }
+
+                // 2) 游戏本体 exe 的图标资源：libraryfolders.vdf 列出所有库 →
+                //    appmanifest_<appid>.acf 的 installdir → common\<installdir> 里的 exe
+                string vdf = System.IO.Path.Combine(root, "steamapps", "libraryfolders.vdf");
+                if (System.IO.File.Exists(vdf))
+                {
+                    var text = System.IO.File.ReadAllText(vdf);
+                    var libMatch = new System.Text.RegularExpressions.Regex("\"path\"\\s+\"([^\"]+)\"");
+                    var dirMatch = new System.Text.RegularExpressions.Regex("\"installdir\"\\s+\"([^\"]+)\"");
+
+                    foreach (System.Text.RegularExpressions.Match lib in libMatch.Matches(text))
+                    {
+                        string acf = System.IO.Path.Combine(
+                            lib.Groups[1].Value.Replace("\\\\", "\\"),
+                            "steamapps", $"appmanifest_{appid}.acf");
+                        if (!System.IO.File.Exists(acf)) continue;
+
+                        var m = dirMatch.Match(System.IO.File.ReadAllText(acf));
+                        if (!m.Success) continue;
+
+                        string gameDir = System.IO.Path.Combine(
+                            lib.Groups[1].Value.Replace("\\\\", "\\"),
+                            "steamapps", "common", m.Groups[1].Value);
+                        if (!System.IO.Directory.Exists(gameDir)) continue;
+
+                        // 主 exe 通常是体积最大的那个，试前三个
+                        var exes = System.IO.Directory.EnumerateFiles(gameDir, "*.exe")
+                            .OrderByDescending(f => new System.IO.FileInfo(f).Length)
+                            .Take(3);
+
+                        foreach (var exe in exes)
+                        {
+                            IntPtr hbmp = NativeShell.GetAppImageHandle(exe, pixels);
+                            var viaExe = ToBitmap(hbmp);
+                            NativeShell.FreeBitmap(hbmp);
+                            if (viaExe != null && OpaqueCoverage(viaExe) >= 0.35) return viaExe;
+                        }
+                    }
+                }
+
+                // 3) logo.png（640x360 透明底 logo，最后的选择）
+                if (System.IO.Directory.Exists(lcDir))
+                {
+                    string logo = System.IO.Path.Combine(lcDir, "logo.png");
+                    if (System.IO.File.Exists(logo)) return LoadImageFile(logo, pixels);
+                }
+            }
+            catch { /* Steam 数据读不动就走常规兜底 */ }
+
+            return null;
+        }
+
+        private static bool IsHex(string s)
+        {
+            foreach (char c in s)
+                if (!Uri.IsHexDigit(c)) return false;
+            return true;
+        }
+
+        /// <summary>按目标宽度解码 png/jpg（WPF 直接读，无需 shell）。</summary>
+        private static BitmapSource LoadImageFile(string path, int pixels)
+        {
+            try
+            {
+                var bi = new System.Windows.Media.Imaging.BitmapImage();
+                bi.BeginInit();
+                bi.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
+                bi.DecodePixelWidth = Math.Max(16, pixels);
+                bi.UriSource = new Uri(path);
+                bi.EndInit();
+                bi.Freeze();
+                return bi;
             }
             catch
             {

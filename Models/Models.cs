@@ -10,7 +10,8 @@ namespace TileBoard.Models
         Small = 0,   // 1x1   71 x 71
         Medium = 1,  // 2x2  150 x 150
         Wide = 2,    // 4x2  308 x 150
-        Large = 3    // 4x4  308 x 308
+        Large = 3,   // 4x4  308 x 308
+        ExtraLarge = 4 // 6x6  466 x 466 —— 3×3 个中磁贴，正好铺满一组六列
     }
 
     /// <summary>Win10 磁贴网格的几何常量。71 + 8 的节奏是 Win10 原始比例：2*71+8 = 150。</summary>
@@ -27,6 +28,7 @@ namespace TileBoard.Models
             TileSize.Medium => 2,
             TileSize.Wide => 4,
             TileSize.Large => 4,
+            TileSize.ExtraLarge => 6,
             _ => 2
         };
 
@@ -36,6 +38,7 @@ namespace TileBoard.Models
             TileSize.Medium => 2,
             TileSize.Wide => 2,
             TileSize.Large => 4,
+            TileSize.ExtraLarge => 6,
             _ => 2
         };
 
@@ -48,6 +51,7 @@ namespace TileBoard.Models
             TileSize.Medium => "中",
             TileSize.Wide => "宽",
             TileSize.Large => "大",
+            TileSize.ExtraLarge => "超大",
             _ => "中"
         };
     }
@@ -70,6 +74,23 @@ namespace TileBoard.Models
         /// <summary>来自默认布局的原始行列，仅作导入时排序参考。</summary>
         public int SourceColumn { get; set; } = -1;
         public int SourceRow { get; set; } = -1;
+
+        // ===== 个性化：三项外观自定义 + 空白磁贴标记，全部可空/可缺省，旧布局 JSON 直接兼容 =====
+
+        /// <summary>自定义图标图片的绝对路径（png/jpg/bmp/ico）。null = 用系统图标链。</summary>
+        public string CustomIconPath { get; set; }
+
+        /// <summary>磁贴底色（#RRGGBB 或 #AARRGGBB）。null = 默认灰（0x3A3A3A）。</summary>
+        public string CustomColor { get; set; }
+
+        /// <summary>磁贴整体透明度 0.15~1.0。默认 1 = 不透明，旧布局没这个字段时反序列化得 0，Load 后有兜底。</summary>
+        public double TileOpacity { get; set; } = 1.0;
+
+        /// <summary>
+        /// 空白磁贴：不来自任何系统应用。Aumid 为空 = 纯观赏占位；有值 = 单击启动该目标
+        /// （路径或 AUMID，与普通磁贴同一条 Launch 链）。图标/底色照常走上面三项自定义。
+        /// </summary>
+        public bool IsBlank { get; set; }
 
         // 这两个是 Size 的推导值，不该进 JSON
         [System.Text.Json.Serialization.JsonIgnore]
@@ -133,6 +154,14 @@ namespace TileBoard.Models
         /// 否则首帧按窄版装箱、之后拉宽，整板会留下一堆莫名单行空洞。
         /// </summary>
         public bool UserPlaced { get; set; }
+
+        // ===== 分组背景自定义：颜色存 #RRGGBB，浓度独立存 0~1，0 = 不画背景 =====
+
+        /// <summary>分组背景色（#RRGGBB）。null = 无背景，画出来就是 Win10 的透明组块。</summary>
+        public string BgColor { get; set; }
+
+        /// <summary>分组背景浓度 0~1。默认 0（旧布局反序列化得 0，正好等于「没设过背景」）。</summary>
+        public double BgOpacity { get; set; } = 0;
     }
 
     /// <summary>整块磁贴板的持久化模型。</summary>
