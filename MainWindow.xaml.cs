@@ -85,6 +85,11 @@ namespace TileBoard
         private bool _dropIntoNewGroup;
         private Border _newGroupHint;
 
+        // 拖动时跟随光标的圆形吸附网格：圆里露出磁贴格线，外加落点那一格的虚线高亮
+        private Grid _snapGrid;         // 羽化过的格线（中间实、边缘虚）
+        private Path _snapLines;        // 格线本体，几何每帧重建
+        private Rectangle _snapSlot;    // 松手会落进去的那一格
+
         /// <summary>
         /// 这次拖的磁贴是不是刚从应用库拎进来的新磁贴（板上原本没有）。
         /// 新磁贴在落进某个组之前不属于任何组，EndDrag 要按这个分支去收尾 ——
@@ -4127,9 +4132,10 @@ namespace TileBoard
 
             // 图标来源三级：主人给的自定义图片 → 系统图标链（非空白磁贴）→ 什么都没有
             bool hasCustom = !string.IsNullOrWhiteSpace(tile.CustomIconPath);
+            bool isWeb = IsWebUrl(tile.Aumid);
             BitmapSource bmp = hasCustom
                 ? LoadUserImage(tile.CustomIconPath)
-                : (tile.IsBlank ? null : _catalog.GetIcon(tile.Aumid, 256));
+                : (tile.IsBlank || isWeb ? null : _catalog.GetIcon(tile.Aumid, 256));
 
             FrameworkElement visual = null;
 
@@ -4137,7 +4143,7 @@ namespace TileBoard
             {
                 // 自定义图片铺满整块磁贴：Uniform 只缩不裁，比例不符时居中留边，
                 // 磁贴多大图就能撑多大 —— 这是「把它当画布」的用法，不是图标展示
-                visual = new Image
+                var picture = new Image
                 {
                     Source = bmp,
                     Width = TileMetrics.Pixels(spanX),
@@ -4146,7 +4152,13 @@ namespace TileBoard
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center
                 };
-                RenderOptions.SetBitmapScalingMode(visual, BitmapScalingMode.HighQuality);
+                RenderOptions.SetBitmapScalingMode(picture, BitmapScalingMode.HighQuality);
+
+                // 动图：上面那张是静态的第一帧，能播就交给播放器逐帧换图；
+                // 静态图这条路什么都不做，Source 保持不动
+                GifAnimator.Attach(picture, tile.CustomIconPath);
+
+                visual = picture;
             }
             else if (bmp != null)
             {
@@ -4160,6 +4172,19 @@ namespace TileBoard
                     VerticalAlignment = VerticalAlignment.Center
                 };
                 RenderOptions.SetBitmapScalingMode(visual, BitmapScalingMode.HighQuality);
+            }
+            else if (isWeb)
+            {
+                // 网页磁贴没有系统图标可拿：给一个地球字形，比字母占位更像「这是个网址」
+                visual = new TextBlock
+                {
+                    Text = "\uE774",
+                    FontFamily = new FontFamily("Segoe MDL2 Assets"),
+                    FontSize = iconPx * 0.78,
+                    Foreground = new SolidColorBrush(Color.FromArgb(0xE6, 0xFF, 0xFF, 0xFF)),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
             }
             else if (!tile.IsBlank)
             {
@@ -4458,6 +4483,7 @@ namespace TileBoard
             {
                 _dropIntoNewGroup = false;
                 HideNewGroupHint();
+                HideSnapGrid();
                 return;
             }
 
@@ -4469,11 +4495,13 @@ namespace TileBoard
                 _lastBoardPoint = TranslatePoint(
                     new Point(p.X - _grabOffset.X, p.Y - _grabOffset.Y), GroupsHost);
                 ShowNewGroupHint(p);
+                ShowSnapGrid(p, null, 0, 0);
                 return;
             }
 
             _dropIntoNewGroup = false;
             HideNewGroupHint();
+            ShowSnapGrid(p, target, col, row);
 
             if (ReferenceEquals(target, _dragGroup))
             {
@@ -4509,6 +4537,7 @@ namespace TileBoard
                 _ghost = null;
             }
             HideNewGroupHint();
+            HideSnapGrid();
 
             TileItem item = _dragItem;
             TileGroup source = _dragGroup;
@@ -4924,6 +4953,206 @@ namespace TileBoard
             if (_newGroupHint != null) _newGroupHint.Visibility = Visibility.Collapsed;
         }
 
+        // ================= 拖动时的圆形吸附网格 =================
+
+        /// <summary>
+        /// 圆直径 = 一个中磁贴的边长（150）。取这个尺寸是因为它刚好罩住
+        /// 「光标附近两格见方」的范围：往哪边偏一格都能在圆里看见格线，
+        /// 又不会大到把半个板面糊上网格。
+        /// </summary>
+        private static readonly double SnapCircleSize = TileMetrics.Pixels(2);
+
+        /// <summary>
+        /// 拖动磁贴时在光标周围画一个圆，圆内露出磁贴格线，并高亮松手会落进去的那一格。
+        /// 格线是照着「磁贴真正的落位节奏」画的 —— 组内从标题下沿起算，组外按板面原点，
+        /// 所以看见的格子就是磁贴能停的地方，不是装饰。
+        /// </summary>
+        private void ShowSnapGrid(Point cursor, TileGroup target, int col, int row)
+        {
+            double size = SnapCircleSize;
+            double radius = size / 2;
+            double left = cursor.X - radius;
+            double top = cursor.Y - radius;
+
+            if (_snapGrid == null)
+            {
+                _snapLines = new Path
+                {
+                    Stroke = new SolidColorBrush(Color.FromArgb(0x66, 0xFF, 0xFF, 0xFF)),
+                    StrokeThickness = 1,
+                    SnapsToDevicePixels = true,
+                    IsHitTestVisible = false
+                };
+
+                // 格线画满整块画布，收边靠径向透明蒙版吃掉 —— 越靠圆周越淡，
+                // 边缘是虚的，不会再描出一道圆的轮廓
+                var lines = new Canvas
+                {
+                    Width = size,
+                    Height = size,
+                    IsHitTestVisible = false,
+                    OpacityMask = BuildSnapFeatherBrush()
+                };
+                lines.Children.Add(_snapLines);
+
+                _snapGrid = new Grid
+                {
+                    Width = size,
+                    Height = size,
+                    IsHitTestVisible = false
+                };
+                _snapGrid.Children.Add(lines);
+
+                // 加在 ghost 之后：格线压在跟随影像上面，但线是半透明的，不挡看内容
+                DragLayer.Children.Add(_snapGrid);
+            }
+
+            // 每轮拖动都会新建一块 ghost，它排在网格之后就会把线盖住 —— 每次都把
+            // 网格挪到最上层，保证「线在磁贴上面」这个次序恒成立
+            if (DragLayer.Children.IndexOf(_snapGrid) != DragLayer.Children.Count - 1)
+            {
+                DragLayer.Children.Remove(_snapGrid);
+                DragLayer.Children.Add(_snapGrid);
+            }
+
+            Canvas.SetLeft(_snapGrid, left);
+            Canvas.SetTop(_snapGrid, top);
+            _snapGrid.Visibility = Visibility.Visible;
+
+            Point host = GroupsHost.TranslatePoint(new Point(0, 0), this);
+            Point origin;
+            if (target == null)
+            {
+                origin = host;
+            }
+            else
+            {
+                // 格线原点取「真实渲染出来的磁贴面板」左上角，而不是自己按
+                // 组坐标 + 标题高再算一遍 —— 标题带实际占多少像素由模板决定，
+                // 算出来的值差几个像素，格线就会浮在磁贴边缘外面。
+                origin = default;
+                bool measured = false;
+
+                var block = FindGroupBlock(target);
+                var panel = block != null && block.ActualWidth > 0
+                    ? FindDescendant<TileGroupPanel>(block)
+                    : null;
+
+                if (panel != null && panel.ActualWidth > 0)
+                {
+                    origin = panel.TranslatePoint(new Point(0, 0), this);
+                    measured = true;
+                }
+
+                if (!measured)
+                {
+                    Rect box = GroupGrid.Box(target);
+                    origin = new Point(host.X + box.X, host.Y + box.Y + GroupGrid.HeaderHeight);
+                }
+            }
+
+            double ox = origin.X;
+            double oy = origin.Y;
+
+            _snapLines.Data = BuildSnapLines(left, top, size, ox, oy);
+
+            if (target == null)
+            {
+                if (_snapSlot != null) _snapSlot.Visibility = Visibility.Collapsed;
+                return;
+            }
+
+            if (_snapSlot == null)
+            {
+                _snapSlot = new Rectangle
+                {
+                    Stroke = new SolidColorBrush(Color.FromArgb(0x8C, 0xFF, 0xFF, 0xFF)),
+                    StrokeThickness = 1,
+                    StrokeDashArray = new DoubleCollection { 3, 3 },
+                    Fill = new SolidColorBrush(Color.FromArgb(0x0E, 0xFF, 0xFF, 0xFF)),
+                    IsHitTestVisible = false
+                };
+                // 垫在随影和网格线下面：高亮落点，不抢磁贴内容
+                DragLayer.Children.Insert(0, _snapSlot);
+            }
+
+            _snapSlot.Width = TileMetrics.Pixels(_dragItem?.SpanX ?? 2);
+            _snapSlot.Height = TileMetrics.Pixels(_dragItem?.SpanY ?? 2);
+            _snapSlot.Visibility = Visibility.Visible;
+            Canvas.SetLeft(_snapSlot, ox + col * TileMetrics.Stride);
+            Canvas.SetTop(_snapSlot, oy + row * TileMetrics.Stride);
+        }
+
+        private void HideSnapGrid()
+        {
+            if (_snapGrid != null) _snapGrid.Visibility = Visibility.Collapsed;
+            if (_snapSlot != null) _snapSlot.Visibility = Visibility.Collapsed;
+        }
+
+        /// <summary>
+        /// 格线的收边蒙版：中间实、靠近圆周往透明滑过去。
+        /// 用它代替圆形裁剪，格线才不会在边界上被切出一道硬弧。
+        /// </summary>
+        private static Brush BuildSnapFeatherBrush()
+        {
+            var brush = new RadialGradientBrush
+            {
+                GradientOrigin = new Point(0.5, 0.5),
+                Center = new Point(0.5, 0.5),
+                RadiusX = 0.5,
+                RadiusY = 0.5
+            };
+            brush.GradientStops.Add(new GradientStop(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF), 0.00));
+            brush.GradientStops.Add(new GradientStop(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF), 0.28));
+            brush.GradientStops.Add(new GradientStop(Color.FromArgb(0x8C, 0xFF, 0xFF, 0xFF), 0.58));
+            brush.GradientStops.Add(new GradientStop(Color.FromArgb(0x1A, 0xFF, 0xFF, 0xFF), 0.84));
+            brush.GradientStops.Add(new GradientStop(Color.FromArgb(0x00, 0xFF, 0xFF, 0xFF), 1.00));
+            brush.Freeze();
+            return brush;
+        }
+
+        /// <summary>
+        /// 只画圆内看得见的那些格线，每格一条：线压在两道磁贴缝的正中
+        /// （格宽 + 半个缝），线与线之间夹住的正好是一格 —— 一格的落位就是 79px 的节奏。
+        /// </summary>
+        private static Geometry BuildSnapLines(double left, double top, double size, double ox, double oy)
+        {
+            // 缝的中线 = 格宽 + 半个缝
+            const double seam = TileMetrics.Cell + TileMetrics.Gap / 2;
+
+            var geo = new StreamGeometry();
+
+            using (StreamGeometryContext ctx = geo.Open())
+            {
+                int k0 = (int)Math.Floor((left - ox) / TileMetrics.Stride) - 1;
+                int k1 = (int)Math.Ceiling((left + size - ox) / TileMetrics.Stride) + 1;
+                for (int k = k0; k <= k1; k++)
+                    AddVLine(ctx, ox + k * TileMetrics.Stride + seam - left, size);
+
+                int j0 = (int)Math.Floor((top - oy) / TileMetrics.Stride) - 1;
+                int j1 = (int)Math.Ceiling((top + size - oy) / TileMetrics.Stride) + 1;
+                for (int j = j0; j <= j1; j++)
+                    AddHLine(ctx, oy + j * TileMetrics.Stride + seam - top, size);
+            }
+
+            geo.Freeze();
+            return geo;
+        }
+
+        private static void AddVLine(StreamGeometryContext ctx, double x, double size)
+        {
+            if (x <= 0 || x >= size) return;
+            ctx.BeginFigure(new Point(x, 0), false, false);
+            ctx.LineTo(new Point(x, size), true, false);
+        }
+
+        private static void AddHLine(StreamGeometryContext ctx, double y, double size)
+        {
+            if (y <= 0 || y >= size) return;
+            ctx.BeginFigure(new Point(0, y), false, false);
+            ctx.LineTo(new Point(size, y), true, false);
+        }
+
         /// <summary>让某个分组的标题直接进入输入状态。</summary>
         private void BeginRenameGroup(TileGroup group)
         {
@@ -4977,7 +5206,12 @@ namespace TileBoard
             if (string.IsNullOrWhiteSpace(aumid)) return;
             try
             {
-                if (Native.NativeShell.LooksLikePath(aumid))
+                if (IsWebUrl(aumid))
+                {
+                    // 网页地址交给默认浏览器，别掉进 shell:AppsFolder 那条 AUMID 路径
+                    Process.Start(new ProcessStartInfo(aumid) { UseShellExecute = true });
+                }
+                else if (Native.NativeShell.LooksLikePath(aumid))
                 {
                     Process.Start(new ProcessStartInfo(aumid) { UseShellExecute = true });
                 }
@@ -5155,14 +5389,37 @@ namespace TileBoard
             }
             else
             {
-                // 纯观赏的空白磁贴：把「给它找点事做」的路数摆在最上面
-                var setTarget = new MenuItem { Header = "设置启动目标…", Icon = MenuIcon("\uE768") };
-                setTarget.Click += (s, e) => PickTileTarget(tile);
-                menu.Items.Add(setTarget);
+                // 纯观赏的空白磁贴：把「给它找点事做」的路数摆在最上面。
+                // 两种活法：绑本地文件/文件夹，或者绑一个网页地址
+                var setTarget = new MenuItem { Header = "设置启动目标", Icon = MenuIcon("\uE768") };
 
-                var rename = new MenuItem { Header = "重命名…", Icon = MenuIcon("\uE8AC") };
-                rename.Click += (s, e) => BeginRenameTile(tile);
-                menu.Items.Add(rename);
+                var pickFile = new MenuItem { Header = "选择文件或文件夹…", Icon = MenuIcon("\uE8A5") };
+                pickFile.Click += (s, e) => PickTileTarget(tile);
+                setTarget.Items.Add(pickFile);
+
+                var pickUrl = new MenuItem { Header = "添加网页地址…", Icon = MenuIcon("\uE774") };
+                pickUrl.Click += (s, e) => SetTileUrlTarget(tile);
+                setTarget.Items.Add(pickUrl);
+
+                menu.Items.Add(setTarget);
+            }
+
+            // 名字归主人管：系统给的名字只是初值，所有磁贴都能改，改过之后还能退回去
+            var rename = new MenuItem { Header = "重命名…", Icon = MenuIcon("\uE8AC") };
+            rename.Click += (s, e) => BeginRenameTile(tile);
+            menu.Items.Add(rename);
+
+            string defaultName = DefaultTileName(tile);
+            if (!string.Equals(tile.Name ?? "", defaultName, StringComparison.Ordinal))
+            {
+                var resetName = new MenuItem { Header = "恢复默认名称", Icon = MenuIcon("\uE777") };
+                resetName.Click += (s, e) =>
+                {
+                    tile.Name = defaultName;
+                    Save();
+                    RenderAll();
+                };
+                menu.Items.Add(resetName);
             }
 
             if (tile.IsBlank && !string.IsNullOrWhiteSpace(tile.Aumid))
@@ -5445,11 +5702,184 @@ namespace TileBoard
             if (dlg.ShowDialog(this) != true) return;
 
             tile.Aumid = dlg.FileName;
+            if (string.IsNullOrWhiteSpace(tile.Name))
+                tile.Name = DefaultTileName(tile);
+
             Save();
             RenderAll();
         }
 
-        /// <summary>空白磁贴的内联改名。原理与分组改名一致：把磁贴面换成输入框，提交后 RenderAll 还原。</summary>
+        /// <summary>给空白磁贴绑一个网页地址：输入后单击磁贴就用默认浏览器打开。</summary>
+        private void SetTileUrlTarget(TileItem tile)
+        {
+            string url = PromptWebUrl(tile.Aumid);
+            if (string.IsNullOrWhiteSpace(url)) return;
+
+            tile.Aumid = url;
+            if (string.IsNullOrWhiteSpace(tile.Name))
+                tile.Name = DefaultTileName(tile);   // 域名去掉 www.，比整串地址好看
+
+            Save();
+            RenderAll();
+        }
+
+        /// <summary>
+        /// 一个小小的网址输入框。没有现成的输入弹窗，这里现搭一个：
+        /// 深色、单行、默认选中协议前缀，回车即确定。
+        /// </summary>
+        private string PromptWebUrl(string initial)
+        {
+            var win = new Window
+            {
+                Title = "添加网页地址",
+                Width = 440,
+                SizeToContent = SizeToContent.Height,
+                WindowStartupLocation = WindowStartupLocation.CenterOwner,
+                Owner = this,
+                ResizeMode = ResizeMode.NoResize,
+                WindowStyle = WindowStyle.ToolWindow,
+                Background = new SolidColorBrush(Color.FromRgb(0x20, 0x20, 0x20)),
+                Foreground = Brushes.White,
+                FontSize = 13,
+                ShowInTaskbar = false
+            };
+
+            var root = new StackPanel { Margin = new Thickness(16) };
+
+            root.Children.Add(new TextBlock
+            {
+                Text = "输入单击磁贴时要打开的网址",
+                Foreground = new SolidColorBrush(Color.FromArgb(0xCC, 0xFF, 0xFF, 0xFF)),
+                Margin = new Thickness(0, 0, 0, 8)
+            });
+
+            var box = new TextBox
+            {
+                Text = string.IsNullOrWhiteSpace(initial) ? "https://" : initial,
+                Background = new SolidColorBrush(Color.FromRgb(0x33, 0x33, 0x33)),
+                Foreground = Brushes.White,
+                CaretBrush = Brushes.White,
+                BorderBrush = new SolidColorBrush(Color.FromRgb(0x5A, 0x5A, 0x5A)),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(6, 5, 6, 5),
+                FontSize = 13
+            };
+            root.Children.Add(box);
+
+            var hint = new TextBlock
+            {
+                Text = "",
+                Foreground = new SolidColorBrush(Color.FromRgb(0xE0, 0x7A, 0x7A)),
+                FontSize = 11.5,
+                Margin = new Thickness(0, 6, 0, 0),
+                TextWrapping = TextWrapping.Wrap
+            };
+            root.Children.Add(hint);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 14, 0, 0)
+            };
+
+            Button MakeButton(string text)
+            {
+                var b = new Button
+                {
+                    Content = text,
+                    Width = 80,
+                    Height = 28,
+                    Margin = new Thickness(8, 0, 0, 0),
+                    Background = new SolidColorBrush(Color.FromRgb(0x3A, 0x3A, 0x3A)),
+                    Foreground = Brushes.White,
+                    BorderBrush = new SolidColorBrush(Color.FromRgb(0x5A, 0x5A, 0x5A)),
+                    BorderThickness = new Thickness(1)
+                };
+                return b;
+            }
+
+            var ok = MakeButton("确定");
+            ok.IsDefault = true;
+            var cancel = MakeButton("取消");
+            cancel.IsCancel = true;
+
+            buttons.Children.Add(ok);
+            buttons.Children.Add(cancel);
+            root.Children.Add(buttons);
+
+            win.Content = root;
+
+            string result = null;
+
+            ok.Click += (s, e) =>
+            {
+                string text = box.Text.Trim();
+                if (text.Length == 0) { hint.Text = "网址不能为空"; return; }
+
+                // 光敲 example.com 也认，补成 https://
+                if (!text.Contains("://")) text = "https://" + text;
+
+                if (!Uri.TryCreate(text, UriKind.Absolute, out Uri uri) ||
+                    (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                {
+                    hint.Text = "只支持 http:// 或 https:// 开头的网址";
+                    return;
+                }
+
+                result = uri.AbsoluteUri;
+                win.DialogResult = true;
+            };
+
+            box.Loaded += (s, e) => { box.Focus(); box.SelectAll(); };
+            box.KeyDown += (s, e) =>
+            {
+                if (e.Key == Key.Enter) { ok.RaiseEvent(new RoutedEventArgs(Button.ClickEvent)); e.Handled = true; }
+            };
+
+            win.ShowDialog();
+            return result;
+        }
+
+        /// <summary>是不是一个可以交给浏览器打开的网页地址。</summary>
+        private static bool IsWebUrl(string value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return false;
+            return value.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || value.StartsWith("https://", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// 磁贴的「默认名」：系统应用取应用名、文件/文件夹取名字、网页取域名（去 www.）、
+        /// 空白磁贴为空。既用来判断当前名字有没有被改过，也做「恢复默认名称」的取值。
+        /// </summary>
+        private string DefaultTileName(TileItem tile)
+        {
+            string aumid = tile.Aumid;
+            if (string.IsNullOrWhiteSpace(aumid)) return "";
+
+            if (IsWebUrl(aumid))
+            {
+                try
+                {
+                    string host = new Uri(aumid).Host;
+                    return host.StartsWith("www.", StringComparison.OrdinalIgnoreCase)
+                        ? host.Substring(4)
+                        : host;
+                }
+                catch
+                {
+                    return aumid;
+                }
+            }
+
+            return _catalog.ResolveName(aumid);
+        }
+
+        /// <summary>
+        /// 磁贴的内联改名。原理与分组改名一致：把磁贴面换成输入框，提交后 RenderAll 还原。
+        /// 小磁贴只有 71px 宽，字号和左右留白都收一档，否则框里剩不下几个字。
+        /// </summary>
         private void BeginRenameTile(TileItem tile)
         {
             if (_renaming) return;
@@ -5458,6 +5888,7 @@ namespace TileBoard
 
             _renaming = true;
             var original = border.Child;
+            bool tiny = tile.Size == TileSize.Small;
 
             var box = new TextBox
             {
@@ -5467,9 +5898,9 @@ namespace TileBoard
                 CaretBrush = Brushes.White,
                 BorderBrush = new SolidColorBrush(Color.FromRgb(0x7A, 0x7A, 0x7A)),
                 BorderThickness = new Thickness(1),
-                Padding = new Thickness(3, 0, 3, 0),
-                FontSize = 12.5,
-                Margin = new Thickness(6, 0, 6, 0),
+                Padding = new Thickness(tiny ? 2 : 3, 0, tiny ? 2 : 3, 0),
+                FontSize = tiny ? 10.5 : 12.5,
+                Margin = new Thickness(tiny ? 3 : 6, 0, tiny ? 3 : 6, 0),
                 VerticalAlignment = VerticalAlignment.Center,
                 VerticalContentAlignment = VerticalAlignment.Center
             };
@@ -5484,7 +5915,13 @@ namespace TileBoard
             {
                 if (committed) return;
                 committed = true;
-                tile.Name = string.IsNullOrWhiteSpace(box.Text) ? "" : box.Text.Trim();
+
+                // 清空就退回默认名：系统磁贴不该出现一块没有名字的方块，
+                // 空白磁贴的默认名本来就是空，等于保持「无名」
+                tile.Name = string.IsNullOrWhiteSpace(box.Text)
+                    ? DefaultTileName(tile)
+                    : box.Text.Trim();
+
                 _renaming = false;
                 Save();
                 RenderAll();
@@ -6810,6 +7247,7 @@ namespace TileBoard
                 _ghost = null;
             }
             HideNewGroupHint();
+            HideSnapGrid();
 
             _dragBorder = null;
             _dragItem = null;

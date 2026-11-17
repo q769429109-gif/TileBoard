@@ -112,6 +112,22 @@ namespace TileBoard.Services
             if (bmp != null && OpaqueCoverage(bmp) >= 0.35)
                 return bmp;
 
+            // 磁盘上的文件夹：图标就是「资源管理器里那个」，不许再按名字去猜快捷方式。
+            // D:\game 这种名字一旦跟某个桌面快捷方式撞上，猜出来的图标会顶掉文件夹
+            // 自己在 desktop.ini 里指定的那一个 —— 明明 shell 已经给得出来。
+            if (System.IO.Directory.Exists(aumid))
+            {
+                IntPtr dirSmall = NativeShell.GetSmallIconHandle(aumid, 48);
+                BitmapSource dirIcon = ToBitmap(dirSmall);
+                NativeShell.FreeBitmap(dirSmall);
+
+                // 48px 是这类自定义文件夹图标的原生尺寸（desktop.ini 指向的 dll 里
+                // 往往只有一两档小图），磁贴按 48 DIP 显示，交给 WPF 高质量放大
+                if (dirIcon != null && OpaqueCoverage(dirIcon) >= 0.2) return dirIcon;
+
+                return bmp;
+            }
+
             // shell 给的是假图标（或没有）：包内 logo（UWP）
             if (aumid.Contains('!'))
             {

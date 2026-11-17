@@ -77,7 +77,10 @@ namespace TileBoard.Models
 
         // ===== 个性化：三项外观自定义 + 空白磁贴标记，全部可空/可缺省，旧布局 JSON 直接兼容 =====
 
-        /// <summary>自定义图标图片的绝对路径（png/jpg/bmp/ico）。null = 用系统图标链。</summary>
+        /// <summary>
+        /// 自定义图标图片的绝对路径（png/jpg/bmp/ico/gif）。null = 用系统图标链。
+        /// gif 会逐帧播放，其余格式按静态图铺满磁贴。
+        /// </summary>
         public string CustomIconPath { get; set; }
 
         /// <summary>磁贴底色（#RRGGBB 或 #AARRGGBB）。null = 默认灰（0x3A3A3A）。</summary>
