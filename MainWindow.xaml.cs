@@ -2268,7 +2268,9 @@ namespace TileBoard
                 {
                     Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
                     Environment.GetFolderPath(Environment.SpecialFolder.Windows),
-                    typeof(MainWindow).Assembly.Location
+                    // 单文件发布时 Assembly.Location 是空串（程序集不在磁盘上），
+                    // 用进程目录代替 —— 两种构建方式都能读到自己的目录
+                    AppContext.BaseDirectory
                 }
                 .Where(p => !string.IsNullOrWhiteSpace(p) &&
                             (System.IO.File.Exists(p) || System.IO.Directory.Exists(p)))

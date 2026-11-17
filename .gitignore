@@ -5,3 +5,4 @@ obj/
 report-*.txt
 shot-*.png
 bin_diag/
+publish/
