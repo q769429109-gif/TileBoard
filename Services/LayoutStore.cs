@@ -27,11 +27,50 @@ namespace TileBoard.Services
                 if (!File.Exists(FilePath)) return null;
                 string json = File.ReadAllText(FilePath);
                 var layout = JsonSerializer.Deserialize<BoardLayout>(json, Options);
-                return layout?.Groups != null && layout.Groups.Count > 0 ? layout : null;
+                if (layout?.Groups == null || layout.Groups.Count == 0) return null;
+
+                HealFolders(layout);
+                return layout;
             }
             catch
             {
                 return null;
+            }
+        }
+
+        /// <summary>
+        /// Win10 的文件夹至少要装两块磁贴。早期版本允许「只剩一块还留着」，
+        /// 这种文件夹读盘时就地治愈：把那一块放回组里，文件夹本身丢掉。
+        /// 不清的话它会一直挂在板上，占着 2x2 的位却只显示一个缩略格。
+        /// </summary>
+        private static void HealFolders(BoardLayout layout)
+        {
+            foreach (var g in layout.Groups)
+            {
+                if (g?.Tiles == null) continue;
+
+                for (int i = g.Tiles.Count - 1; i >= 0; i--)
+                {
+                    var t = g.Tiles[i];
+                    if (t == null || !t.IsFolder) continue;
+
+                    var kids = new List<TileItem>();
+                    foreach (var c in t.Children)
+                        if (c != null) kids.Add(c);
+
+                    if (kids.Count >= 2) continue;
+
+                    // 先把剩下的一两块插回文件夹原来的位置，再把文件夹摘掉 ——
+                    // 顺序反过来会让下标错位，磁贴落到组的末尾去
+                    for (int k = 0; k < kids.Count; k++)
+                    {
+                        kids[k].Column = -1;
+                        kids[k].Row = -1;
+                        g.Tiles.Insert(i, kids[k]);
+                    }
+
+                    g.Tiles.Remove(t);
+                }
             }
         }
 

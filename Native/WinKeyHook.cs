@@ -379,6 +379,9 @@ namespace TileBoard.Native
             return down && up;
         }
 
+        /// <summary>通用注入：按一下再抬起。电源按钮借它敲 Win+X / U。</summary>
+        public static bool InjectVk(uint vk) => SendKey(vk, 0) && SendKey(vk, 0x0002);
+
         private static bool SendKey(uint vk, uint flags)
         {
             var input = new INPUT

@@ -81,6 +81,9 @@ namespace TileBoard
         private bool _mouseDown;
         private bool _dragging;
 
+        // 这次拖动是从文件夹面板里拖出来的：开始真正拖动时要先把磁贴搬回板面
+        private TileItem _folderDragSource;
+
         // 落点是否是「组外空白」——松手就新建一个分组
         private bool _dropIntoNewGroup;
         private Border _newGroupHint;
@@ -89,6 +92,10 @@ namespace TileBoard
         private Grid _snapGrid;         // 羽化过的格线（中间实、边缘虚）
         private Path _snapLines;        // 格线本体，几何每帧重建
         private Rectangle _snapSlot;    // 松手会落进去的那一格
+
+        // 拖动时压在哪块磁贴上：松手就和它合并成文件夹（或加入已有文件夹）
+        private TileItem _mergeTarget;
+        private Rectangle _mergeHint;   // 合并目标的描边提示
 
         /// <summary>
         /// 这次拖的磁贴是不是刚从应用库拎进来的新磁贴（板上原本没有）。
@@ -214,12 +221,12 @@ namespace TileBoard
         private double _panV;
 
         // —— 滚轮惯性 ——
-        // 滚轮事件不再直接滚：每格滚轮往 _scrollVel 里加一把速度，逐帧按 exp(-dt·k) 衰减，
-        // 速度掉到阈值以下或者顶到板面边缘就收尾。幅度（每格加多少、衰减多快）由设置里的
-        // 滚动惯性档位给 —— 0 档根本不进这条链，滚轮行为退回 WPF 原生。
-        private double _scrollVel;          // 当前纵向速度，px/s，正 = 往下
-        private TimeSpan _scrollLastFrame;  // 上一帧的渲染时间，算 dt 用
-        private bool _scrollAnimating;      // Rendering 挂没挂着，防重复订阅
+        // 滚轮事件不再直接滚：每格滚轮往速度里加一笔，逐帧按 exp(-dt·k) 衰减，
+        // 速度掉到阈值以下或者顶到边缘就收尾。幅度由设置里的滚动惯性档位给 ——
+        // 0 档根本不进这条链，滚轮行为退回 WPF 原生。
+        // 板面和应用库各持一个实例：两个 ScrollViewer 的偏移互不相干，速度也必须分开记。
+        private WheelInertiaScroll _boardInertia;
+        private WheelInertiaScroll _appsInertia;
 
         // 右边缘拖拽改宽度
         private bool _resizing;
@@ -364,6 +371,14 @@ namespace TileBoard
         private void OnKeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key != Key.Escape) return;
+
+            // 文件夹展开面板最上层：Esc 先收它
+            if (_folderOverlay != null)
+            {
+                CloseFolder();
+                e.Handled = true;
+                return;
+            }
 
             // 设置页 / 手机页开着就只收页，别顺手把整个面板关掉
             if (SettingsPage.Visibility == Visibility.Visible)
@@ -637,6 +652,73 @@ namespace TileBoard
 
         // ================= 滚轮惯性 =================
 
+        /// <summary>
+        /// 一个 ScrollViewer 的滚轮惯性。速度、逐帧衰减、订阅状态全在实例里 ——
+        /// 板面和应用库各拿一个，同一份代码喂两处，手感才不会一天一地。
+        /// </summary>
+        private sealed class WheelInertiaScroll
+        {
+            private readonly ScrollViewer _sv;
+            private double _vel;              // px/s，正 = 往下
+            private TimeSpan _lastFrame;
+            private bool _running;
+
+            public WheelInertiaScroll(ScrollViewer sv) { _sv = sv; }
+
+            /// <summary>滚轮进来：加一笔速度，然后让逐帧动画去花。inertia 是 0~100 的档位。</summary>
+            public void Kick(double wheelDelta, double inertia)
+            {
+                // 一格滚轮 Δ=120。档位 100 时每格 ≈ 840 px/s 初速，配 τ≈0.2s 的衰减，
+                // 一格能多滑出 170px 左右；档位就是按比例放大这条尾巴。
+                // WPF 的 Delta 往前滚（向上）为正，而 VerticalOffset 往下为正 —— 方向取反
+                _vel = Math.Clamp(_vel - wheelDelta * (inertia / 100.0) * 7.0, -6000, 6000);
+
+                if (_running) return;
+                _running = true;
+                _lastFrame = TimeSpan.Zero;
+                CompositionTarget.Rendering += Frame;
+            }
+
+            private void Frame(object sender, EventArgs e)
+            {
+                var args = (RenderingEventArgs)e;
+                double dt = _lastFrame == TimeSpan.Zero
+                    ? 0
+                    : (args.RenderingTime - _lastFrame).TotalSeconds;
+                _lastFrame = args.RenderingTime;
+                if (dt <= 0) return;
+
+                // 速度太小就收尾：别让 Rendering 空转，也别出现永远滑不完的一像素
+                if (Math.Abs(_vel) < 12)
+                {
+                    Stop();
+                    return;
+                }
+
+                double max = Math.Max(0, _sv.ScrollableHeight);
+                double y = _sv.VerticalOffset + _vel * dt;
+
+                // 顶到上下缘：停在边上，剩下的速度作废
+                if (y <= 0 || y >= max)
+                {
+                    _sv.ScrollToVerticalOffset(Math.Clamp(y, 0, max));
+                    Stop();
+                    return;
+                }
+
+                _sv.ScrollToVerticalOffset(y);
+                _vel *= Math.Exp(-dt * 5.0);
+            }
+
+            public void Stop()
+            {
+                _vel = 0;
+                if (!_running) return;
+                _running = false;
+                CompositionTarget.Rendering -= Frame;
+            }
+        }
+
         /// <summary>滚轮进来：按惯性档位把速度加一笔，然后让逐帧动画去花。</summary>
         private void BoardScroll_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
@@ -644,58 +726,25 @@ namespace TileBoard
             if (inertia <= 0) return;   // 0 档 = 关，直接走 WPF 原生滚动
 
             e.Handled = true;
-
-            // 一格滚轮 Δ=120。档位 100 时每格 ≈ 840 px/s 初速，配 τ≈0.2s 的衰减，
-            // 一格能多滑出 170px 左右；档位就是按比例放大这条尾巴。
-            // WPF 的 Delta 往前滚（向上）为正，而 VerticalOffset 往下为正 —— 方向取反
-            _scrollVel = Math.Clamp(_scrollVel - e.Delta * (inertia / 100.0) * 7.0, -6000, 6000);
-            StartInertiaScroll();
+            (_boardInertia ??= new WheelInertiaScroll(BoardScroll)).Kick(e.Delta, inertia);
         }
 
-        private void StartInertiaScroll()
+        /// <summary>应用库的滚轮惯性：和板面同一档位、同一套衰减曲线。</summary>
+        private void AppsList_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
-            if (_scrollAnimating) return;
-            _scrollAnimating = true;
-            _scrollLastFrame = TimeSpan.Zero;
-            CompositionTarget.Rendering += InertiaFrame;
-        }
+            double inertia = Math.Clamp(_ui.ScrollInertia, 0, 100);
+            if (inertia <= 0) return;
 
-        private void InertiaFrame(object sender, EventArgs e)
-        {
-            var args = (RenderingEventArgs)e;
-            double dt = _scrollLastFrame == TimeSpan.Zero
-                ? 0
-                : (args.RenderingTime - _scrollLastFrame).TotalSeconds;
-            _scrollLastFrame = args.RenderingTime;
-            if (dt <= 0) return;
-
-            // 速度太小就收尾：别让 Rendering 空转，也别出现永远滑不完的一像素
-            if (Math.Abs(_scrollVel) < 12)
+            // ListBox 的 ScrollViewer 在模板里，控件加载完才存在 —— 第一次滚轮时现找一次
+            if (_appsInertia == null)
             {
-                StopInertiaScroll();
-                return;
+                var sv = FindDescendant<ScrollViewer>(AppsList);
+                if (sv == null) return;   // 还没实例化：这一次交给原生滚动
+                _appsInertia = new WheelInertiaScroll(sv);
             }
 
-            double max = Math.Max(0, BoardScroll.ScrollableHeight);
-            double y = BoardScroll.VerticalOffset + _scrollVel * dt;
-
-            // 顶到板面上下缘：停在边上，剩下的速度作废
-            if (y <= 0 || y >= max)
-            {
-                BoardScroll.ScrollToVerticalOffset(Math.Clamp(y, 0, max));
-                StopInertiaScroll();
-                return;
-            }
-
-            BoardScroll.ScrollToVerticalOffset(y);
-            _scrollVel *= Math.Exp(-dt * 5.0);
-        }
-
-        private void StopInertiaScroll()
-        {
-            _scrollVel = 0;
-            _scrollAnimating = false;
-            CompositionTarget.Rendering -= InertiaFrame;
+            e.Handled = true;
+            _appsInertia.Kick(e.Delta, inertia);
         }
 
         // ================= 设置页 / 手机页 =================
@@ -1172,6 +1221,14 @@ namespace TileBoard
             string groupTestPath = GetArg("--grouptest");
             if (groupTestPath != null) { RunGroupTest(groupTestPath); return; }
 
+            // 调试/验收用：--powertest <txt> 验证「给 shell 寄 SC_CLOSE → 系统弹关机对话框」这条路
+            string powerTestPath = GetArg("--powertest");
+            if (powerTestPath != null) { RunPowerProbe(powerTestPath); return; }
+
+            // 调试/验收用：--wxtest <txt> 验证「注入 Win+X → U」能不能拉到系统「关机或注销」子菜单
+            string wxTestPath = GetArg("--wxtest");
+            if (wxTestPath != null) { RunWinXProbe(wxTestPath); return; }
+
             // 调试/验收用：--dragtest <txt> 自己跑一遍「拿起→移动→落位」
             string dragTestPath = GetArg("--dragtest");
             if (dragTestPath != null) { RunDragTest(dragTestPath); return; }
@@ -1288,6 +1345,14 @@ namespace TileBoard
                 await CaptureAndExit(phoneShot);
                 return;
             }
+
+            // 临时自检：--folderdragtest <txt> 从展开面板里把一块磁贴拖到板面上
+            string folderDragTest = GetArg("--folderdragtest");
+            if (folderDragTest != null) { await RunFolderDragTest(folderDragTest); return; }
+
+            // 临时自检：--foldertest <txt> 文件夹的建立 / 菜单移出 / 只剩一块自动解散
+            string folderTest = GetArg("--foldertest");
+            if (folderTest != null) { await RunFolderTakeOutTest(folderTest); return; }
 
             // 调试/验收用：--shot <路径> 让应用把自身界面渲染成 PNG 后退出
             string shotPath = GetShotPath();
@@ -3077,6 +3142,116 @@ namespace TileBoard
         }
 
 
+        /// <summary>
+        /// 验证「电源按钮请系统弹关机对话框」这条路：
+        /// 寄 SC_CLOSE 给 shell 桌面 → 等 1.2s → 枚举窗口找 #32770「关闭 Windows」。
+        /// 找到了顺手关掉，别把对话框留在主人屏幕上。
+        /// </summary>
+        private void RunPowerProbe(string path)
+        {
+            var lines = new List<string>();
+
+            IntPtr shell = Native.PowerMenu.ShellWindow();
+            lines.Add("shell hwnd = 0x" + shell.ToInt64().ToString("X"));
+
+            var before = Native.PowerMenu.DumpTopWindows();
+            lines.Add("windows before = " + before.Count);
+            lines.Add("post SC_CLOSE = " + Native.PowerMenu.RequestShutdownDialog());
+
+            var timer = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(1200)
+            };
+            timer.Tick += (s, e) =>
+            {
+                timer.Stop();
+
+                IntPtr dlg = Native.PowerMenu.FindShutdownDialog();
+                lines.Add("shutdown dialog = 0x" + dlg.ToInt64().ToString("X") +
+                          (dlg != IntPtr.Zero ? "  FOUND" : "  NOT FOUND"));
+
+                var after = Native.PowerMenu.DumpTopWindows();
+                lines.Add("windows after = " + after.Count);
+                lines.Add("--- new windows ---");
+                foreach (var w in after)
+                {
+                    string hwnd = w.Split(' ')[0];
+                    if (!before.Exists(b => b.StartsWith(hwnd + " "))) lines.Add(w);
+                }
+
+                if (dlg != IntPtr.Zero) Native.PowerMenu.CloseWindow(dlg);
+                lines.Add("dialog closed = " + (dlg != IntPtr.Zero));
+
+                try { System.IO.File.WriteAllText(path, string.Join("\n", lines)); } catch { }
+                Application.Current.Shutdown();
+            };
+            timer.Start();
+        }
+
+        /// <summary>
+        /// 验证「注入 Win+X → U」能不能拉出系统「关机或注销」子菜单。
+        /// 板面是 Topmost，先收起来；Windows 的 Quick Link 菜单是 shell 的普通窗口。
+        /// 每步把新增的顶层窗口列出来，跑完连按两下 Esc 收拾现场。
+        /// </summary>
+        private void RunWinXProbe(string path)
+        {
+            var lines = new List<string>();
+            var before = Native.PowerMenu.DumpTopWindows();
+            lines.Add("windows before = " + before.Count);
+
+            Hide();   // 板面会把 Quick Link 菜单整块盖住
+
+            Native.WinKeyHook.InjectWinDown();
+            Native.WinKeyHook.InjectVk(0x58);   // Win+X
+            Native.WinKeyHook.InjectWinUp();
+            lines.Add("injected Win+X");
+
+            var t1 = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(700)
+            };
+            t1.Tick += (s, e) =>
+            {
+                t1.Stop();
+
+                var mid = Native.PowerMenu.DumpTopWindows();
+                lines.Add("windows after Win+X = " + mid.Count);
+                foreach (var w in mid)
+                {
+                    string hwnd = w.Split(' ')[0];
+                    if (!before.Exists(b => b.StartsWith(hwnd + " "))) lines.Add("  NEW " + w);
+                }
+
+                Native.WinKeyHook.InjectVk(0x55);   // U = 关机或注销
+                lines.Add("injected U");
+
+                var t2 = new System.Windows.Threading.DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(500)
+                };
+                t2.Tick += (s2, e2) =>
+                {
+                    t2.Stop();
+
+                    var after = Native.PowerMenu.DumpTopWindows();
+                    lines.Add("windows after U = " + after.Count);
+                    foreach (var w in after)
+                    {
+                        string hwnd = w.Split(' ')[0];
+                        if (!before.Exists(b => b.StartsWith(hwnd + " "))) lines.Add("  NEW " + w);
+                    }
+
+                    Native.WinKeyHook.InjectEsc();   // 收子菜单
+                    Native.WinKeyHook.InjectEsc();   // 收 Quick Link
+
+                    try { System.IO.File.WriteAllText(path, string.Join("\n", lines)); } catch { }
+                    Application.Current.Shutdown();
+                };
+                t2.Start();
+            };
+            t1.Start();
+        }
+
         /// <summary>不走鼠标，直接把「抓起分组 → 吸附格位 → 挤开邻居」跑一遍。</summary>
         private async void RunGroupTest(string path)
         {
@@ -3220,6 +3395,211 @@ namespace TileBoard
             return _layout.Groups.Any(g => g != null &&
                 (g.Column < 0 || g.Row < 0 ||
                  g.Column + GroupGrid.SpanColumns(g) > cols));
+        }
+
+        // ===== 临时自检：从文件夹展开面板里把磁贴拖出来 =====
+        private async Task RunFolderDragTest(string path)
+        {
+            await Task.Delay(2200);
+            var lines = new List<string>();
+
+            var group = _layout?.Groups.FirstOrDefault(g => g.Tiles != null && g.Tiles.Count >= 3);
+            if (group == null)
+            {
+                System.IO.File.WriteAllText(path, "没有可用分组\n");
+                Application.Current.Shutdown();
+                return;
+            }
+
+            var a = group.Tiles[0];
+            var b = group.Tiles[1];
+
+            var folder = new TileItem { IsBlank = true, Column = a.Column, Row = a.Row };
+            folder.Children = new List<TileItem> { a, b };
+            group.Tiles.Remove(a);
+            group.Tiles.Remove(b);
+            group.Tiles.Insert(0, folder);
+            Save();
+            RenderAll();
+            await Task.Delay(250);
+
+            OpenFolder(folder);
+            await Task.Delay(300);
+            RevealForCapture();
+
+            Border childBorder = _folderOverlay == null ? null : FindTaggedBorder(_folderOverlay, b);
+            lines.Add("面板里找到目标磁贴 = " + (childBorder != null ? "✔" : "✘"));
+            if (childBorder == null)
+            {
+                System.IO.File.WriteAllText(path, string.Join("\n", lines) + "\n");
+                Application.Current.Shutdown();
+                return;
+            }
+
+            _dragItem = b;
+            _dragGroup = GroupOf(folder);
+            _dragBorder = childBorder;
+            _folderDragSource = folder;
+            _mouseDown = true;
+            _dragging = false;
+
+            Point start = childBorder.TranslatePoint(new Point(24, 24), this);
+            StartDrag(start);
+
+            lines.Add("拖动开始后面板 = " + (_folderOverlay == null ? "已收起 ✔" : "没收起 ✘"));
+            lines.Add("文件夹剩 = " + folder.Children.Count + " 项（原本 2）");
+            lines.Add("文件夹自动解散 = " + (!group.Tiles.Contains(folder) ? "✔" : "✘"));
+            lines.Add("剩下那块回到组里 = " + (group.Tiles.Contains(a) ? "✔" : "✘"));
+            lines.Add("磁贴回到组里 = " + (group.Tiles.Contains(b) ? "✔" : "✘"));
+            lines.Add("_dragging = " + _dragging + "  _folderDragSource = " +
+                      (_folderDragSource == null ? "已清空 ✔" : "还在 ✘"));
+
+            await Task.Delay(150);
+
+            // 重建后分组可能被 Normalize 挪过位置：先退回拖动起点的坐标再算落点，
+            // 否则算出来的屏幕坐标和 UpdateDrag 判定的那套坐标对不上
+            RestoreDragSnapshot();
+            RestoreDragGroupsSnapshot();
+
+            // 找一个不属于任何分组的板面空位：落到这里会长出一个新分组，
+            // 是「磁贴真的回到板面上」最干脆的验法
+            Point host0 = GroupsHost.TranslatePoint(new Point(0, 0), this);
+            Point drop = start;
+            bool foundEmpty = false;
+            for (double y = host0.Y + 40; y < host0.Y + GroupsHost.ActualHeight - 24 && !foundEmpty; y += 24)
+                for (double x = host0.X + 40; x < host0.X + GroupsHost.ActualWidth - 24 && !foundEmpty; x += 24)
+                    if (!TryResolveDrop(new Point(x, y), out _, out _, out _))
+                    {
+                        drop = new Point(x, y);
+                        foundEmpty = true;
+                    }
+            lines.Add("找到组外空位 = " + (foundEmpty ? "✔" : "✘（用起点代替）"));
+
+            int groupCountBefore = _layout.Groups.Count;
+
+            UpdateDrag(drop);
+            await Task.Delay(200);
+            SaveRootPng(path + "-drag.png");
+
+            lines.Add("落点 = " + (_dropIntoNewGroup ? "组外新建分组 ✔" : "组内落位 ✘"));
+            lines.Add("合并目标 = " + (_mergeTarget?.Name ?? "无 ✔"));
+
+            EndDrag();
+            await Task.Delay(400);
+            RevealForCapture();
+
+            TileGroup home = GroupOf(b);
+            lines.Add("松手后所在组 = " + (home == null ? "不在任何组 ✘"
+                : ReferenceEquals(home, group) ? "还是原来的组 ✘" : "新分组 ✔"));
+            lines.Add("松手后格位 = (" + b.Column + "," + b.Row + ")");
+            lines.Add("分组数 = " + groupCountBefore + " → " + _layout.Groups.Count);
+            lines.Add("松手后文件夹剩 = " + folder.Children.Count + " 项");
+            lines.Add("面板 = " + (_folderOverlay == null ? "已收起 ✔" : "还开着 ✘"));
+
+            SaveRootPng(path + "-after.png");
+            System.IO.File.WriteAllText(path, string.Join("\n", lines) + "\n");
+            Application.Current.Shutdown();
+        }
+
+        // ===== 临时自检：右键「移出到板面」与只剩一块时的自动解散 =====
+        private async Task RunFolderTakeOutTest(string path)
+        {
+            await Task.Delay(2000);
+            var lines = new List<string>();
+
+            var group = _layout?.Groups.FirstOrDefault(g => g.Tiles != null && g.Tiles.Count >= 4);
+            if (group == null)
+            {
+                System.IO.File.WriteAllText(path, "没有可用分组\n");
+                Application.Current.Shutdown();
+                return;
+            }
+
+            var a = group.Tiles[0];
+            var b = group.Tiles[1];
+            var c = group.Tiles[2];
+
+            var folder = new TileItem { IsBlank = true, Column = a.Column, Row = a.Row };
+            folder.Children = new List<TileItem> { a, b, c };
+            group.Tiles.Remove(a);
+            group.Tiles.Remove(b);
+            group.Tiles.Remove(c);
+            group.Tiles.Insert(0, folder);
+            Save();
+            RenderAll();
+            await Task.Delay(250);
+
+            // 一、文件夹菜单里有没有「移出到板面」，子项是不是把三块都列出来了
+            var menu = BuildFolderMenu(folder, group);
+            var sub = menu.Items.OfType<MenuItem>()
+                          .FirstOrDefault(m => (m.Header as string) == "移出到板面");
+            lines.Add("菜单含「移出到板面」= " + (sub != null ? "✔" : "✘"));
+            lines.Add("子项数 = " + (sub?.Items.Count ?? 0) + "（应为 3）");
+
+            // 面板长什么样：拍一张留证，标题 + 移出提示都该在
+            OpenFolder(folder);
+            await Task.Delay(320);
+            RevealForCapture();
+            await Task.Delay(120);
+            SaveRootPng(path + "-panel.png");
+            CloseFolder();
+
+            // 二、移出一块：文件夹还在，剩 2 项
+            TakeOutOfFolder(folder, b);
+            await Task.Delay(220);
+            lines.Add("移出 1 块 → 文件夹仍在组里 = " + (group.Tiles.Contains(folder) ? "✔" : "✘"));
+            lines.Add("  文件夹剩 = " + folder.Children.Count + "（应为 2）");
+            lines.Add("  移出的磁贴回到组里 = " + (group.Tiles.Contains(b) ? "✔" : "✘"));
+            lines.Add("  它的格位 = (" + b.Column + "," + b.Row + ")");
+
+            // 三、再移出一块：只剩一块，Win10 规则 → 文件夹解散，最后一块也回板面
+            TakeOutOfFolder(folder, a);
+            await Task.Delay(220);
+            lines.Add("移出第 2 块 → 文件夹已解散 = " + (!group.Tiles.Contains(folder) ? "✔" : "✘"));
+            lines.Add("  最后一块回到组里 = " + (group.Tiles.Contains(c) ? "✔" : "✘"));
+            lines.Add("  三块都在组里 = " +
+                      new[] { a, b, c }.Count(t => group.Tiles.Contains(t)) + "/3");
+            lines.Add("  文件夹 Children 已清空 = " + (folder.Children.Count == 0 ? "✔" : "✘"));
+
+            // 四、存盘重读：JSON 里不该留下只剩 0~1 项的残废文件夹
+            Save();
+            var reload = LayoutStore.Load();
+            int broken = reload.Groups.Where(g => g.Tiles != null)
+                .SelectMany(g => g.Tiles)
+                .Count(t => t != null && t.IsFolder && (t.Children == null || t.Children.Count < 2));
+            lines.Add("重读布局无残废文件夹 = " + (broken == 0 ? "✔" : "✘（" + broken + " 个）"));
+
+            RevealForCapture();
+            await Task.Delay(200);
+            SaveRootPng(path + ".png");
+
+            System.IO.File.WriteAllText(path, string.Join("\n", lines) + "\n");
+            Application.Current.Shutdown();
+        }
+
+        private static bool SlotTaken(TileGroup g, int col, int row, int sx, int sy)
+        {
+            foreach (var t in g.Tiles)
+            {
+                if (t == null) continue;
+                if (col < t.Column + t.SpanX && t.Column < col + sx &&
+                    row < t.Row + t.SpanY && t.Row < row + sy) return true;
+            }
+            return false;
+        }
+
+        private static Border FindTaggedBorder(DependencyObject root, object tag)
+        {
+            if (root == null) return null;
+            int n = VisualTreeHelper.GetChildrenCount(root);
+            for (int i = 0; i < n; i++)
+            {
+                var child = VisualTreeHelper.GetChild(root, i);
+                if (child is Border bd && ReferenceEquals(bd.Tag, tag)) return bd;
+                var hit = FindTaggedBorder(child, tag);
+                if (hit != null) return hit;
+            }
+            return null;
         }
 
         private async Task CaptureAndExit(string path)
@@ -3572,6 +3952,10 @@ namespace TileBoard
         {
             if (!IsVisible || _hiding) return;
 
+            // 面板要淡出时，文件夹那层浮盖先收掉：它是最后加进 RootGrid 的，
+            // 留着就会跟着一起淡出，下次唤出还挂在那儿
+            CloseFolder();
+
             _hiding = true;
             _fadeSeq++;             // 作废在途的逐格淡入，别和淡出动画打架
             int token = ++_fadeToken;
@@ -3638,6 +4022,9 @@ namespace TileBoard
 
         private void RenderAll()
         {
+            // 板面要重建：浮层里挂的还是旧元素，先收掉，免得点到已经不存在的磁贴
+            CloseFolder();
+
             double keepOffset = BoardScroll?.VerticalOffset ?? 0;
 
             GroupsHost.Children.Clear();
@@ -3968,6 +4355,19 @@ namespace TileBoard
 
         private static Brush Freeze(Brush b) { b.Freeze(); return b; }
 
+        /// <summary>磁贴的底色与悬停色：自定义色优先，没设就是 Win10 默认灰。</summary>
+        private static void TileColors(TileItem tile, out Brush back, out Brush hoverBack)
+        {
+            back = TileBack;
+            hoverBack = TileBackHover;
+
+            if (TryParseColor(tile.CustomColor, out Color custom))
+            {
+                back = Freeze(new SolidColorBrush(custom));
+                hoverBack = Freeze(new SolidColorBrush(Blend(custom, Colors.White, 0.12)));
+            }
+        }
+
         // ================= 磁贴/分组个性化：颜色与图片的小工具 =================
 
         /// <summary>把 JSON 里的颜色字符串（#RRGGBB / #AARRGGBB）解析回 Color。格式不对或为空返回 false。</summary>
@@ -4041,6 +4441,17 @@ namespace TileBoard
         /// <summary>磁贴悬停提示。空白磁贴要说明它现在的状态（观赏 / 启动目标）。</summary>
         private static string TileTooltip(TileItem tile)
         {
+            if (tile.IsFolder)
+            {
+                int count = tile.Children?.Count ?? 0;
+                string head = FolderLabel(tile) + "（" + count + " 项）";
+
+                var names = (tile.Children ?? new List<TileItem>())
+                    .Where(c => c != null).Take(4).Select(DisplayTileName).ToList();
+
+                return names.Count == 0 ? head : head + "\n" + string.Join("、", names);
+            }
+
             if (tile.IsBlank)
             {
                 string head = string.IsNullOrWhiteSpace(tile.Name) ? "空白磁贴" : tile.Name;
@@ -4053,30 +4464,26 @@ namespace TileBoard
 
         /// <summary>菜单标题栏与状态提示里用的磁贴名。空白没起名的叫「空白磁贴」，别显示一行空。</summary>
         private static string DisplayTileName(TileItem tile) =>
-            string.IsNullOrWhiteSpace(tile.Name)
-                ? (tile.IsBlank ? "空白磁贴" : "(未命名)")
-                : tile.Name;
+            tile.IsFolder
+                ? FolderLabel(tile)
+                : string.IsNullOrWhiteSpace(tile.Name)
+                    ? (tile.IsBlank ? "空白磁贴" : "(未命名)")
+                    : tile.Name;
 
         private UIElement CreateTile(TileGroup group, TileItem tile)
         {
-            int spanX = TileMetrics.SpanX(tile.Size);
-            int spanY = TileMetrics.SpanY(tile.Size);
+            int spanX = tile.SpanX;
+            int spanY = tile.SpanY;
 
             // 底色：主人自定义的颜色优先，没设才用 Win10 默认灰。
             // 悬停色跟着自定义色走 —— 提亮一档，不然深色磁贴悬停时看不出反应
-            Brush back = TileBack;
-            Brush hoverBack = TileBackHover;
-            if (TryParseColor(tile.CustomColor, out Color custom))
-            {
-                back = Freeze(new SolidColorBrush(custom));
-                hoverBack = Freeze(new SolidColorBrush(Blend(custom, Colors.White, 0.12)));
-            }
+            TileColors(tile, out Brush back, out Brush hoverBack);
 
             // 磁贴整体透明度。<=0 是旧布局没写过这个字段的记号，按不透明算
             double opacity = tile.TileOpacity <= 0 ? 1.0 : Math.Clamp(tile.TileOpacity, 0.15, 1.0);
 
-            // 纯观赏的空白磁贴点了没反应，光标就不该是手
-            bool launchable = !tile.IsBlank || !string.IsNullOrWhiteSpace(tile.Aumid);
+            // 纯观赏的空白磁贴点了没反应，光标就不该是手；文件夹点了要展开
+            bool launchable = tile.IsFolder || !tile.IsBlank || !string.IsNullOrWhiteSpace(tile.Aumid);
 
             var border = new Border
             {
@@ -4118,6 +4525,10 @@ namespace TileBoard
         /// <summary>磁贴内部：图标居中偏上、名称压在左下角。拖动时的跟随影像也复用它。</summary>
         private Grid BuildTileSurface(TileItem tile, int spanX, int spanY, out Border hover)
         {
+            // 文件夹不画单个图标：它的表面是 2x2 的缩略格
+            if (tile.IsFolder)
+                return BuildFolderSurface(tile, out hover);
+
             var grid = new Grid();
 
             int iconPx = tile.Size switch
@@ -4242,6 +4653,111 @@ namespace TileBoard
             return grid;
         }
 
+        /// <summary>
+        /// 文件夹磁贴的表面：2x2 四宫格，每格 71x71、间距 8 —— 正好填满一块 150x150 的中磁贴，
+        /// 和 Win10 的文件夹缩略是同一套几何。超过 4 个也只摆前 4 个，全部内容在展开的浮层里。
+        /// </summary>
+        private Grid BuildFolderSurface(TileItem folder, out Border hover)
+        {
+            TileColors(folder, out Brush back, out _);
+
+            var grid = new Grid
+            {
+                Width = TileMetrics.Pixels(2),
+                Height = TileMetrics.Pixels(2),
+                Background = back
+            };
+
+            var canvas = new Canvas
+            {
+                Width = TileMetrics.Pixels(2),
+                Height = TileMetrics.Pixels(2)
+            };
+
+            int shown = Math.Min(4, folder.Children?.Count ?? 0);
+            for (int i = 0; i < shown; i++)
+            {
+                TileItem child = folder.Children[i];
+                TileColors(child, out Brush cellBack, out _);
+
+                var cell = new Border
+                {
+                    Width = TileMetrics.Cell,
+                    Height = TileMetrics.Cell,
+                    Background = cellBack,
+                    Child = BuildFolderCellIcon(child)
+                };
+
+                Canvas.SetLeft(cell, (i % 2) * TileMetrics.Stride);
+                Canvas.SetTop(cell, (i / 2) * TileMetrics.Stride);
+                canvas.Children.Add(cell);
+            }
+
+            grid.Children.Add(canvas);
+
+            hover = new Border
+            {
+                Background = new SolidColorBrush(Color.FromArgb(0x14, 0xFF, 0xFF, 0xFF)),
+                Opacity = 0,
+                IsHitTestVisible = false
+            };
+            grid.Children.Add(hover);
+
+            return grid;
+        }
+
+        /// <summary>文件夹缩略格里的小图标：和普通磁贴同一条图标链，只是缩到 32px。</summary>
+        private FrameworkElement BuildFolderCellIcon(TileItem tile)
+        {
+            const double px = 32;
+
+            BitmapSource bmp = !string.IsNullOrWhiteSpace(tile.CustomIconPath)
+                ? LoadUserImage(tile.CustomIconPath)
+                : (tile.IsBlank || IsWebUrl(tile.Aumid) ? null : _catalog.GetIcon(tile.Aumid, 64));
+
+            if (bmp != null)
+            {
+                var img = new Image
+                {
+                    Source = bmp,
+                    Width = px,
+                    Height = px,
+                    Stretch = Stretch.Uniform,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                RenderOptions.SetBitmapScalingMode(img, BitmapScalingMode.HighQuality);
+                return img;
+            }
+
+            if (IsWebUrl(tile.Aumid))
+            {
+                return new TextBlock
+                {
+                    Text = "\uE774",
+                    FontFamily = new FontFamily("Segoe MDL2 Assets"),
+                    FontSize = px * 0.62,
+                    Foreground = new SolidColorBrush(Color.FromArgb(0xE6, 0xFF, 0xFF, 0xFF)),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+            }
+
+            if (!tile.IsBlank)
+            {
+                return new TextBlock
+                {
+                    Text = string.IsNullOrEmpty(tile.Name) ? "?" : tile.Name.Substring(0, 1).ToUpperInvariant(),
+                    FontSize = px * 0.5,
+                    Foreground = new SolidColorBrush(Color.FromArgb(0xAA, 0xFF, 0xFF, 0xFF)),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+            }
+
+            return null;
+        }
+
         // ================= 拖拽 / 启动 =================
 
         private void Tile_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -4353,14 +4869,22 @@ namespace TileBoard
                 return;
             }
 
+            bool fromFolder = _folderDragSource != null;
             TileItem item = _dragItem;
             _dragBorder = null;
             _dragItem = null;
             _dragGroup = null;
+            _folderDragSource = null;
 
             // 空白磁贴没绑启动目标 = 纯观赏，单击就是单击，什么都不发生
-            if (item != null && !(item.IsBlank && string.IsNullOrWhiteSpace(item.Aumid)))
-                Launch(item.Aumid);
+            if (item != null)
+            {
+                if (item.IsFolder) OpenFolder(item);
+                else if (!(item.IsBlank && string.IsNullOrWhiteSpace(item.Aumid))) Launch(item.Aumid);
+            }
+
+            // 面板里的单击：启动完把面板收起，和直接点板面上的磁贴观感一致
+            if (fromFolder) CloseFolder();
         }
 
         private void StartDrag(Point p)
@@ -4368,8 +4892,8 @@ namespace TileBoard
             if (_dragBorder == null || _dragItem == null) return;
             _dragging = true;
 
-            int sx = TileMetrics.SpanX(_dragItem.Size);
-            int sy = TileMetrics.SpanY(_dragItem.Size);
+            int sx = Math.Clamp(_dragItem.SpanX, 1, TileMetrics.GridColumns);
+            int sy = Math.Max(1, _dragItem.SpanY);
 
             Point topLeft = _dragBorder.TranslatePoint(new Point(0, 0), this);
             _grabOffset = new Point(p.X - topLeft.X, p.Y - topLeft.Y);
@@ -4400,6 +4924,15 @@ namespace TileBoard
             // 拍一张全场的坐标快照：拖动中每次落点变化都从这里重算，
             // 而不是在上一次的推挤结果上继续叠加
             TakeDragSnapshot();
+
+            // 从文件夹面板里拖出来的：面板位置和板面不是同一套坐标，抓取偏移取完就作废。
+            // 这里把磁贴真的搬回组里（RenderAll 会顺手收起面板），后面完全按板面上的拖动走
+            if (_folderDragSource != null)
+            {
+                TileItem folder = _folderDragSource;
+                _folderDragSource = null;
+                DetachFromFolderForDrag(folder, _dragItem);
+            }
 
             HideDraggedTile();
             UpdateDrag(p);
@@ -4484,6 +5017,7 @@ namespace TileBoard
                 _dropIntoNewGroup = false;
                 HideNewGroupHint();
                 HideSnapGrid();
+                HideMergeHint();
                 return;
             }
 
@@ -4492,6 +5026,7 @@ namespace TileBoard
                 // 拖到任何分组之外：松手就在这里开一个新分组。
                 // 记下板面坐标，新分组才能生在落点那一格，而不是被装到末尾
                 _dropIntoNewGroup = true;
+                HideMergeHint();
                 _lastBoardPoint = TranslatePoint(
                     new Point(p.X - _grabOffset.X, p.Y - _grabOffset.Y), GroupsHost);
                 ShowNewGroupHint(p);
@@ -4501,6 +5036,18 @@ namespace TileBoard
 
             _dropIntoNewGroup = false;
             HideNewGroupHint();
+
+            // 压在某块磁贴上：松手是合并，不是落位。这里既不挪坐标也不让别人让位，
+            // 只给目标描个边 —— 一让位，目标就跑到旁边去了，反而永远对不准
+            TileItem merge = FindMergeTarget(target, col, row);
+            if (merge != null)
+            {
+                ShowMergeHint(target, merge);
+                HideSnapGrid();
+                return;
+            }
+
+            HideMergeHint();
             ShowSnapGrid(p, target, col, row);
 
             if (ReferenceEquals(target, _dragGroup))
@@ -4541,12 +5088,16 @@ namespace TileBoard
 
             TileItem item = _dragItem;
             TileGroup source = _dragGroup;
+            TileItem mergeInto = _mergeTarget;
+            HideMergeHint();
+
             bool newGroup = _dropIntoNewGroup;
             bool wasNew = _dragIsNew;
 
             _dragBorder = null;
             _dragItem = null;
             _dragGroup = null;
+            _folderDragSource = null;
             _dropIntoNewGroup = false;
             _dragIsNew = false;
             _dragSnapshot = null;
@@ -4556,6 +5107,16 @@ namespace TileBoard
             // 收一次账 —— 该让位的让位，且只让这一次
             RestoreDragGroupsSnapshot();
             _dragGroupSnapshot = null;
+
+            // 压在别的磁贴上松手 = 合并成文件夹，或者放进已有的文件夹
+            if (mergeInto != null && item != null && CanMerge(item, mergeInto))
+            {
+                MergeIntoTile(item, mergeInto);
+
+                // 从应用库拖来的新磁贴并进去之后，列表里那一行也要立刻标成「已在板上」
+                if (wasNew) MarkPinned(item.Aumid);
+                return;
+            }
 
             if (newGroup && item != null)
             {
@@ -4951,6 +5512,529 @@ namespace TileBoard
         private void HideNewGroupHint()
         {
             if (_newGroupHint != null) _newGroupHint.Visibility = Visibility.Collapsed;
+        }
+
+        // ================= 磁贴文件夹 =================
+
+        /// <summary>一块磁贴所属的组。找不到返回 null（刚从应用库拖进来的新磁贴就属于这种情况）。</summary>
+        private TileGroup GroupOf(TileItem tile) =>
+            tile == null ? null : _layout?.Groups.FirstOrDefault(g => g != null && g.Tiles.Contains(tile));
+
+        /// <summary>文件夹的名字：Win10 的文件夹默认没有名字，展开面板标题就用「文件夹」。</summary>
+        private static string FolderLabel(TileItem folder) =>
+            string.IsNullOrWhiteSpace(folder.Name) ? "文件夹" : folder.Name;
+
+        /// <summary>一组磁贴区左上角的窗口坐标（标题带下面那一行的起点）。</summary>
+        private Point TileOriginOf(TileGroup group)
+        {
+            Point host = GroupsHost.TranslatePoint(new Point(0, 0), this);
+
+            // 优先用真正渲染出来的面板：标题带实占多高由模板决定，自己算会差几像素
+            var block = FindGroupBlock(group);
+            var panel = block != null && block.ActualWidth > 0
+                ? FindDescendant<TileGroupPanel>(block)
+                : null;
+
+            if (panel != null && panel.ActualWidth > 0)
+                return panel.TranslatePoint(new Point(0, 0), this);
+
+            Rect box = GroupGrid.Box(group);
+            return new Point(host.X + box.X, host.Y + box.Y + GroupGrid.HeaderHeight);
+        }
+
+        /// <summary>
+        /// 拖动影像此刻压在谁身上。
+        ///
+        /// 判据放在「格位空间」而不是像素空间：拖动落点已经被 TryResolveDrop 换算成格位，
+        /// 只要落点矩形和某块磁贴的格位矩形重叠过半，就算压在它身上。这样既不依赖
+        /// 触摸屏/缩放下的像素换算，也不受板面滚动位置影响。
+        /// </summary>
+        private TileItem FindMergeTarget(TileGroup group, int col, int row)
+        {
+            if (_dragItem == null || group?.Tiles == null) return null;
+
+            int sx = Math.Clamp(_dragItem.SpanX, 1, TileMetrics.GridColumns);
+            int sy = Math.Max(1, _dragItem.SpanY);
+
+            foreach (var t in group.Tiles)
+            {
+                if (t == null || ReferenceEquals(t, _dragItem)) continue;
+                if (!CanMerge(_dragItem, t)) continue;
+
+                int w = Math.Min(col + sx, t.Column + t.SpanX) - Math.Max(col, t.Column);
+                int h = Math.Min(row + sy, t.Row + t.SpanY) - Math.Max(row, t.Row);
+
+                if (w <= 0 || h <= 0) continue;
+
+                // 落点几乎正对目标时才算：挨着边放仍然是要「摆在旁边」
+                if (w * h >= t.SpanX * t.SpanY * 0.45) return t;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 能不能合并。文件夹只能作为「容器」接收普通磁贴；文件夹本身不再被塞进别处，
+        /// 两块文件夹之间也不合并 —— 和 Win10 的限制一致，也免得层级无限套下去。
+        /// </summary>
+        private static bool CanMerge(TileItem from, TileItem into) =>
+            from != null && into != null && !ReferenceEquals(from, into) && !from.IsFolder;
+
+        private void ShowMergeHint(TileGroup group, TileItem target)
+        {
+            if (_mergeHint == null)
+            {
+                _mergeHint = new Rectangle
+                {
+                    Stroke = new SolidColorBrush(Color.FromArgb(0xC0, 0xFF, 0xFF, 0xFF)),
+                    StrokeThickness = 2,
+                    Fill = new SolidColorBrush(Color.FromArgb(0x1A, 0xFF, 0xFF, 0xFF)),
+                    IsHitTestVisible = false
+                };
+                DragLayer.Children.Insert(0, _mergeHint);
+            }
+
+            _mergeTarget = target;
+
+            Point origin = TileOriginOf(group);
+            _mergeHint.Width = TileMetrics.Pixels(target.SpanX);
+            _mergeHint.Height = TileMetrics.Pixels(target.SpanY);
+            Canvas.SetLeft(_mergeHint, origin.X + target.Column * TileMetrics.Stride);
+            Canvas.SetTop(_mergeHint, origin.Y + target.Row * TileMetrics.Stride);
+            _mergeHint.Visibility = Visibility.Visible;
+        }
+
+        private void HideMergeHint()
+        {
+            _mergeTarget = null;
+            if (_mergeHint != null) _mergeHint.Visibility = Visibility.Collapsed;
+        }
+
+        /// <summary>
+        /// 把一块磁贴并进去。两种情况：
+        ///   · into 是普通磁贴 —— 两块合成一个新文件夹，占住 into 原来的格位
+        ///   · into 是文件夹   —— 直接把 from 放进它的 Children，文件夹本身不动
+        /// 两种情况都先把 from 从原组摘掉，跨组搬也一样。
+        /// </summary>
+        private void MergeIntoTile(TileItem from, TileItem into)
+        {
+            if (from == null || into == null) return;
+
+            TileGroup targetGroup = GroupOf(into);
+            TileGroup fromGroup = GroupOf(from);
+            if (targetGroup == null && fromGroup == null) return;
+
+            if (into.IsFolder)
+            {
+                fromGroup?.Tiles.Remove(from);
+                from.Column = -1;
+                from.Row = -1;
+                from.SourceColumn = -1;
+                from.SourceRow = -1;
+                into.Children.Add(from);
+
+                if (fromGroup != null && !ReferenceEquals(fromGroup, targetGroup))
+                    TileGrid.Normalize(fromGroup);
+
+                SetStatus("已放进「" + FolderLabel(into) + "」，共 " + into.Children.Count + " 项");
+            }
+            else
+            {
+                var folder = new TileItem
+                {
+                    Size = TileSize.Medium,
+                    Column = into.Column,
+                    Row = into.Row,
+                    Children = new List<TileItem> { into, from }
+                };
+
+                GroupOf(from)?.Tiles.Remove(from);
+                targetGroup?.Tiles.Remove(into);
+                targetGroup?.Tiles.Add(folder);
+
+                into.Column = into.Row = -1;
+                into.SourceColumn = into.SourceRow = -1;
+                from.Column = from.Row = -1;
+                from.SourceColumn = from.SourceRow = -1;
+
+                if (fromGroup != null && !ReferenceEquals(fromGroup, targetGroup))
+                    TileGrid.Normalize(fromGroup);
+
+                SetStatus("已合并为文件夹");
+            }
+
+            Save();
+            RenderAll();
+        }
+
+        /// <summary>解散文件夹：里面的磁贴按顺序放回它所在的组，文件夹自己消失。</summary>
+        private void ExplodeFolder(TileItem folder)
+        {
+            TileGroup group = GroupOf(folder);
+            if (group == null || !folder.IsFolder) return;
+
+            int index = group.Tiles.IndexOf(folder);
+            var children = folder.Children.ToList();
+
+            group.Tiles.Remove(folder);
+
+            foreach (var child in children)
+            {
+                child.Column = -1;
+                child.Row = -1;
+                if (index >= 0 && index <= group.Tiles.Count) group.Tiles.Insert(index++, child);
+                else group.Tiles.Add(child);
+            }
+
+            Save();
+            RenderAll();
+            SetStatus("已解散文件夹，放出 " + children.Count + " 块磁贴");
+        }
+
+        /// <summary>
+        /// 把一块磁贴从文件夹里搬到板面上（它原来所在的那一组）。
+        ///
+        /// 拿到手的东西先清成一粒「新磁贴」（格位 = -1），交给 Normalize 去装箱 ——
+        /// 文件夹自己还占着那块 2x2，搬出来的磁贴只能另找空位，这一点和 Win10 一致。
+        ///
+        /// 收口规则也照 Win10：
+        ///   · 搬完一块不剩 —— 文件夹本身没有意义了，直接撤掉
+        ///   · 搬完只剩一块 —— 文件夹降级，最后那台也一起回到板面（Win10 不允许单位置文件夹）
+        /// </summary>
+        private bool DetachChildFromFolder(TileItem folder, TileItem child)
+        {
+            TileGroup group = GroupOf(folder);
+            if (group == null || folder?.Children == null || child == null) return false;
+            if (!folder.Children.Remove(child)) return false;
+
+            var released = new List<TileItem> { child };
+            TileItem last = null;
+
+            if (folder.Children.Count == 0)
+            {
+                group.Tiles.Remove(folder);
+            }
+            else if (folder.Children.Count == 1)
+            {
+                last = folder.Children[0];
+                folder.Children.Clear();
+                group.Tiles.Remove(folder);
+                if (last != null) released.Add(last);
+            }
+
+            foreach (var t in released)
+            {
+                t.Column = -1;
+                t.Row = -1;
+                t.SourceColumn = -1;
+                t.SourceRow = -1;
+                group.Tiles.Add(t);
+            }
+
+            // 只剩一块而连它一起搬出来时，把「文件夹被拆了」这件事也告诉调用方
+            if (last != null) _lastTakeOutDissolved = true;
+            return true;
+        }
+
+        /// <summary>上一次移出是否顺手把文件夹拆了 —— 只用于状态栏措辞。</summary>
+        private bool _lastTakeOutDissolved;
+
+        /// <summary>右键菜单里的「移出到板面」：搬出来、存盘、重排，并说明它落在哪一组。</summary>
+        private void TakeOutOfFolder(TileItem folder, TileItem child)
+        {
+            if (child == null) return;
+
+            _lastTakeOutDissolved = false;
+            if (!DetachChildFromFolder(folder, child)) return;
+
+            Save();
+            RenderAll();
+
+            TileGroup home = GroupOf(child);
+            string where = home == null ? "板面" :
+                (home.IsUnnamed ? "所在分组" : "「" + home.Name + "」");
+
+            SetStatus(_lastTakeOutDissolved
+                ? "已移出「" + DisplayTileName(child) + "」并解散文件夹，磁贴回到" + where
+                : "已移出到板面：" + DisplayTileName(child) + "（" + where + "）");
+        }
+
+        /// <summary>
+        /// 从展开面板里拖出来：先把磁贴搬回它所在的组（格位先空着，交给 Normalize），
+        /// 再让拖动流程接管落点。RenderAll 会顺手把面板收掉 —— 手上一块影像在飞，
+        /// 底下还压着一层遮罩的话，人看不见板面，也就落不准。
+        /// </summary>
+        private void DetachFromFolderForDrag(TileItem folder, TileItem child)
+        {
+            if (!DetachChildFromFolder(folder, child)) return;
+
+            Save();
+            RenderAll();
+        }
+
+        // ================= 文件夹展开面板 =================
+
+        private Grid _folderOverlay;
+
+        /// <summary>
+        /// 点开文件夹：盖一层遮罩，中间摆一块面板，把里面的磁贴按正常尺寸铺出来。
+        /// Win10 是「文件夹磁贴自己放大」的动画，这里用居中面板 + 淡入代替 ——
+        /// 交互是一样的：点里面任意一块就启动，点面板外或按 Esc 收起。
+        /// </summary>
+        private void OpenFolder(TileItem folder)
+        {
+            if (folder == null || !folder.IsFolder) return;
+            CloseFolder();
+
+            var children = folder.Children.Where(c => c != null).ToList();
+            if (children.Count == 0) return;
+
+            int perRow = children.Count <= 4 ? 2 : 4;
+            const double gap = 8;
+            double cell = TileMetrics.Pixels(2) + gap;
+
+            var wrap = new WrapPanel
+            {
+                Orientation = Orientation.Horizontal,
+                Width = perRow * cell
+            };
+
+            foreach (var child in children)
+                wrap.Children.Add(BuildFolderChildTile(folder, child));
+
+            var scroll = new ScrollViewer
+            {
+                Content = wrap,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled
+            };
+
+            // 面板里的滚动也走板面那套惯性：同一个档位、同一份手感，
+            // 不然板面上滑得顺、一点开文件夹就变回生硬的一格一跳
+            var folderInertia = new WheelInertiaScroll(scroll);
+            scroll.PreviewMouseWheel += (s, e) =>
+            {
+                double level = Math.Clamp(_ui.ScrollInertia, 0, 100);
+                if (level <= 0) return;      // 0 档 = 关，退回 WPF 原生
+                e.Handled = true;
+                folderInertia.Kick(e.Delta, level);
+            };
+
+            // 标题 + 一句怎么移出的提示：拖动这条路没有视觉提示，只能写出来
+            var head = new StackPanel { Margin = new Thickness(0, 0, 8, 12) };
+
+            head.Children.Add(new TextBlock
+            {
+                Text = FolderLabel(folder) + "（" + children.Count + " 项）",
+                FontSize = 14,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = new SolidColorBrush(Color.FromArgb(0xF0, 0xFF, 0xFF, 0xFF))
+            });
+
+            head.Children.Add(new TextBlock
+            {
+                Text = "拖动磁贴到板面即可移出 · 右键可单独移出 · 点空白处或 Esc 收起",
+                FontSize = 11,
+                Margin = new Thickness(0, 4, 0, 0),
+                Foreground = new SolidColorBrush(Color.FromArgb(0x88, 0xFF, 0xFF, 0xFF))
+            });
+
+            var body = new StackPanel();
+            body.Children.Add(head);
+            body.Children.Add(scroll);
+
+            var panel = new Border
+            {
+                Background = new SolidColorBrush(Color.FromRgb(0x24, 0x24, 0x24)),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(0x33, 0xFF, 0xFF, 0xFF)),
+                BorderThickness = new Thickness(1),
+                Padding = new Thickness(18, 16, 10, 8),
+                Child = body,
+                MaxHeight = Math.Max(220, ActualHeight - 120),
+                MaxWidth = Math.Max(320, ActualWidth - 80),
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            var overlay = new Grid
+            {
+                Background = new SolidColorBrush(Color.FromArgb(0x99, 0x00, 0x00, 0x00)),
+                Opacity = 0
+            };
+            Grid.SetColumnSpan(overlay, 3);
+
+            overlay.Children.Add(panel);
+            overlay.MouseLeftButtonDown += (s, e) =>
+            {
+                CloseFolder();
+                e.Handled = true;
+            };
+
+            // 面板内部点击不收起：给了 Handled 就传不到遮罩上
+            panel.MouseLeftButtonDown += (s, e) => e.Handled = true;
+            panel.MouseRightButtonUp += (s, e) => e.Handled = true;
+
+            RootGrid.Children.Add(overlay);
+            _folderOverlay = overlay;
+
+            overlay.BeginAnimation(OpacityProperty, new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(130))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            });
+        }
+
+        private void CloseFolder()
+        {
+            _folderDragSource = null;
+            if (_folderOverlay == null) return;
+            RootGrid.Children.Remove(_folderOverlay);
+            _folderOverlay = null;
+        }
+
+        /// <summary>展开面板里的一块磁贴：外观和板面上的一致，点一下启动，右键是它自己的菜单。</summary>
+        private UIElement BuildFolderChildTile(TileItem folder, TileItem child)
+        {
+            TileColors(child, out Brush back, out Brush hoverBack);
+            double opacity = child.TileOpacity <= 0 ? 1.0 : Math.Clamp(child.TileOpacity, 0.15, 1.0);
+
+            var border = new Border
+            {
+                Width = TileMetrics.Pixels(child.SpanX),
+                Height = TileMetrics.Pixels(child.SpanY),
+                Margin = new Thickness(0, 0, 8, 8),
+                Background = back,
+                Opacity = opacity,
+                Cursor = Cursors.Hand,
+                Tag = child
+            };
+
+            border.Child = BuildTileSurface(child, child.SpanX, child.SpanY, out Border hover);
+
+            border.MouseEnter += (s, e) =>
+            {
+                hover.Opacity = 1;
+                border.Background = hoverBack;
+            };
+            border.MouseLeave += (s, e) =>
+            {
+                hover.Opacity = 0;
+                border.Background = back;
+            };
+
+            border.MouseLeftButtonDown += (s, e) =>
+            {
+                e.Handled = true;
+
+                // 按下先只记账，别急着启动：再挪超过阈值就是从文件夹里往外拖。
+                // 松手前没挪动才算单击，启动放到 OnWindowMouseLeftButtonUp 里收
+                TileGroup owner = GroupOf(folder);
+                if (owner == null || _mouseDown || _dragging) return;
+
+                _dragItem = child;
+                _dragGroup = owner;
+                _dragBorder = border;
+                _folderDragSource = folder;
+                _dragOrigin = e.GetPosition(this);
+                _mouseDown = true;
+                _dragging = false;
+
+                // 捕获挂窗口上：拖出面板会重建板面，挂在磁贴上的捕获会跟着失效
+                Mouse.Capture(this, CaptureMode.Element);
+            };
+
+            border.MouseRightButtonUp += (s, e) =>
+            {
+                var menu = BuildTileMenu(child, GroupOf(folder));
+                menu.Items.Add(new Separator());
+
+                var takeOut = new MenuItem { Header = "移出到板面", Icon = MenuIcon("\uE8A7") };
+                takeOut.Click += (a, b) =>
+                {
+                    // 移出后 RenderAll 会把这层浮盖收掉。文件夹还在就顺手重新展开，
+                    // 主人可以连着移出好几块，不用每移一块重新点开一次
+                    TakeOutOfFolder(folder, child);
+                    if (folder.IsFolder && GroupOf(folder) != null) OpenFolder(folder);
+                };
+                menu.Items.Add(takeOut);
+
+                menu.PlacementTarget = border;
+                menu.Placement = PlacementMode.MousePoint;
+                menu.IsOpen = true;
+                e.Handled = true;
+            };
+
+            return border;
+        }
+
+        /// <summary>文件夹磁贴的右键菜单：展开、重命名、解散。</summary>
+        private ContextMenu BuildFolderMenu(TileItem folder, TileGroup group)
+        {
+            var menu = MakeMenu();
+
+            menu.Items.Add(new MenuItem
+            {
+                Header = FolderLabel(folder) + "（" + (folder.Children?.Count ?? 0) + " 项）",
+                IsEnabled = false
+            });
+            menu.Items.Add(new Separator());
+
+            var open = new MenuItem { Header = "展开", Icon = MenuIcon("\uE8A7") };
+            open.Click += (s, e) => OpenFolder(folder);
+            menu.Items.Add(open);
+
+            // 不移出、不展开，直接从菜单里点某一块回到板面 ——
+            // 大文件夹（十几项）展开后再拖太绕，这一条是「移出」最快的路
+            var children = (folder.Children ?? new List<TileItem>())
+                .Where(c => c != null).ToList();
+
+            if (children.Count > 0)
+            {
+                var pullOut = new MenuItem { Header = "移出到板面", Icon = MenuIcon("\uE8A7") };
+
+                foreach (var c in children.Take(14))
+                {
+                    TileItem target = c;
+                    var one = new MenuItem
+                    {
+                        Header = DisplayTileName(target) +
+                                 (target.IsFolder ? "（文件夹）" : "")
+                    };
+                    one.Click += (s, e) => TakeOutOfFolder(folder, target);
+                    pullOut.Items.Add(one);
+                }
+
+                if (children.Count > 14)
+                {
+                    var more = new MenuItem
+                    {
+                        Header = "还有 " + (children.Count - 14) + " 项，展开后拖动移出…"
+                    };
+                    more.Click += (s, e) => OpenFolder(folder);
+                    pullOut.Items.Add(new Separator());
+                    pullOut.Items.Add(more);
+                }
+
+                menu.Items.Add(pullOut);
+            }
+
+            var rename = new MenuItem { Header = "重命名…", Icon = MenuIcon("\uE8AC") };
+            rename.Click += (s, e) => BeginRenameTile(folder);
+            menu.Items.Add(rename);
+
+            if (!string.IsNullOrWhiteSpace(folder.Name))
+            {
+                var resetName = new MenuItem { Header = "恢复默认名称", Icon = MenuIcon("\uE777") };
+                resetName.Click += (s, e) => { folder.Name = null; Save(); RenderAll(); };
+                menu.Items.Add(resetName);
+            }
+
+            menu.Items.Add(new Separator());
+
+            var explode = new MenuItem { Header = "解散文件夹", Icon = MenuIcon("\uE74D") };
+            explode.Click += (s, e) => ExplodeFolder(folder);
+            menu.Items.Add(explode);
+
+            return menu;
         }
 
         // ================= 拖动时的圆形吸附网格 =================
@@ -5374,6 +6458,9 @@ namespace TileBoard
 
         private ContextMenu BuildTileMenu(TileItem tile, TileGroup group)
         {
+            // 文件夹有自己的一套：尺寸固定、没有「打开」，主要动作是展开和解散
+            if (tile.IsFolder) return BuildFolderMenu(tile, group);
+
             var menu = MakeMenu();
 
             menu.Items.Add(new MenuItem { Header = DisplayTileName(tile), IsEnabled = false });
@@ -6778,7 +7865,69 @@ namespace TileBoard
             catch (Exception ex) { SetStatus("打开设置失败：" + ex.Message); }
         }
 
+        /// <summary>
+        /// 电源：弹系统自己的电源菜单，不再自建一套仿冒菜单。
+        ///
+        /// 用的是 Win+X → U：Win+X 是 shell 的 Quick Link 菜单（右击开始按钮那个），
+        /// U 直接打开「关机或注销」子菜单 —— 睡眠 / 关机 / 重启 / 注销 全是系统的。
+        /// 为什么不寄 SC_CLOSE 给桌面：实测 Win11 26200 上桌面窗口根本不认这条消息，
+        /// 前后窗口一个都不多（--powertest 有记录）。
+        ///
+        /// 关键前提：Quick Link 是 shell 的普通弹出窗口，会被 Topmost 板面整块盖住，
+        /// 所以必须先收板面。注入的按键我们的低级钩子默认忽略（acceptInjected=false），
+        /// 会原样落到 shell 手里 —— 探针实测过这条链。
+        /// 退程序已经挪到上面的 BtnQuit，这里只管系统电源。
+        /// </summary>
         private void BtnPower_Click(object sender, RoutedEventArgs e)
+        {
+            HideBoard();
+
+            var before = Native.PowerMenu.DumpTopWindows();
+
+            Native.WinKeyHook.InjectWinDown();
+            Native.WinKeyHook.InjectVk(0x58);   // Win+X
+            Native.WinKeyHook.InjectWinUp();
+
+            // 菜单是异步绘制的，等它站稳再敲 U；U 丢了也不影响 —— 用户仍能看到
+            // Quick Link 菜单自己点「关机或注销」
+            var open = new System.Windows.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(260)
+            };
+            open.Tick += (s1, e1) =>
+            {
+                open.Stop();
+                Native.WinKeyHook.InjectVk(0x55);   // U = 关机或注销
+
+                // 600ms 后确认菜单真的开了；没开就把板面还回去 + 退回自建菜单，
+                // 「按了电源什么也没发生」这种场面不能有
+                var check = new System.Windows.Threading.DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(600)
+                };
+                check.Tick += (s2, e2) =>
+                {
+                    check.Stop();
+
+                    bool opened = Native.PowerMenu.DumpTopWindows().Exists(w =>
+                        !before.Contains(w) && w.Contains("Xaml_WindowedPopupClass"));
+
+                    if (opened) return;
+
+                    LogHookState2("power menu did not appear, fallback menu");
+                    ShowBoard();
+                    ShowFallbackPowerMenu();
+                };
+                check.Start();
+            };
+            open.Start();
+        }
+
+        /// <summary>退出磁贴板。工具菜单里的「退出」和这里同一条路。</summary>
+        private void BtnQuit_Click(object sender, RoutedEventArgs e) => Close();
+
+        /// <summary>系统电源对话框不可用时的退路。</summary>
+        private void ShowFallbackPowerMenu()
         {
             var menu = MakeMenu();
 
@@ -6787,8 +7936,6 @@ namespace TileBoard
             menu.Items.Add(new Separator());
             menu.Items.Add(MakePowerItem("重启", () => ConfirmAndRun("重启", "/r")));
             menu.Items.Add(MakePowerItem("关机", () => ConfirmAndRun("关机", "/s")));
-            menu.Items.Add(new Separator());
-            menu.Items.Add(MakePowerItem("退出磁贴板", Close));
 
             menu.PlacementTarget = BtnPower;
             menu.Placement = PlacementMode.Top;

@@ -4,3 +4,4 @@ obj/
 *.user
 report-*.txt
 shot-*.png
+bin_diag/

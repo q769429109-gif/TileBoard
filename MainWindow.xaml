@@ -56,8 +56,12 @@
                             Content="&#xE790;" ToolTip="个性化" Click="BtnAppearance_Click"/>
                     <Button x:Name="BtnSettings" Style="{StaticResource RailButton}"
                             Content="&#xE713;" ToolTip="Windows 设置" Click="BtnSettings_Click"/>
+                    <!-- 退出磁贴板：单独一颗，摆在电源上方。电源那颗弹的是系统自己的
+                         「关闭 Windows」对话框，退程序这种事不该混在里面 -->
+                    <Button x:Name="BtnQuit" Style="{StaticResource RailButton}"
+                            Content="&#xE711;" ToolTip="退出磁贴板" Click="BtnQuit_Click"/>
                     <Button x:Name="BtnPower" Style="{StaticResource RailButton}"
-                            Content="&#xE7E8;" ToolTip="电源" Click="BtnPower_Click"/>
+                            Content="&#xE7E8;" ToolTip="电源（系统关机菜单）" Click="BtnPower_Click"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -303,6 +307,7 @@
                          PreviewMouseLeftButtonDown="AppsList_PreviewMouseLeftButtonDown"
                          PreviewMouseMove="AppsList_PreviewMouseMove"
                          PreviewMouseLeftButtonUp="AppsList_PreviewMouseLeftButtonUp"
+                         PreviewMouseWheel="AppsList_PreviewMouseWheel"
                          MouseRightButtonUp="AppsList_MouseRightButtonUp">
                     <ListBox.ItemContainerStyle>
                         <Style TargetType="ListBoxItem">

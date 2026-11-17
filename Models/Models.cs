@@ -95,12 +95,23 @@ namespace TileBoard.Models
         /// </summary>
         public bool IsBlank { get; set; }
 
-        // 这两个是 Size 的推导值，不该进 JSON
-        [System.Text.Json.Serialization.JsonIgnore]
-        public int SpanX => TileMetrics.SpanX(Size);
+        /// <summary>
+        /// 磁贴文件夹里装着的磁贴。null = 普通磁贴；非 null（哪怕空）= 文件夹。
+        /// Win10 的文件夹就是一块 2x2 的中磁贴，里面是 4 个 1x1 的缩略格，
+        /// 所以文件夹的尺寸不看 Size，一律按 2x2 算。
+        /// </summary>
+        public List<TileItem> Children { get; set; }
 
         [System.Text.Json.Serialization.JsonIgnore]
-        public int SpanY => TileMetrics.SpanY(Size);    }
+        public bool IsFolder => Children != null;
+
+        // 这两个是 Size 的推导值，不该进 JSON
+        [System.Text.Json.Serialization.JsonIgnore]
+        public int SpanX => IsFolder ? 2 : TileMetrics.SpanX(Size);
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        public int SpanY => IsFolder ? 2 : TileMetrics.SpanY(Size);
+    }
 
     /// <summary>一个磁贴分组。</summary>
     public class TileGroup
