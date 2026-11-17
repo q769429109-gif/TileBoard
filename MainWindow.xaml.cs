@@ -684,7 +684,7 @@ namespace TileBoard
                 }
 
                 if (!hooked)
-                    SetStatus($"Win 键接管失败（错误码 {_winHook.LastError}），请用 Ctrl+Alt+空格 唤出");
+                    SetStatus($"Win 键接管失败，用 Ctrl+Alt+空格 唤出");
                 LogHookState(hooked);
                 LogHookState2($"hook_alive={alive}  （False 表示被别的软件吞掉或已被系统摘钩，靠轮询兜底）");
 
@@ -974,7 +974,7 @@ namespace TileBoard
             SyncBackdropControls();
             ApplyAppearance(new WindowInteropHelper(this).Handle);
             QueueSettingsSave();
-            SetStatus("背景图已清除，回到纯色底");
+            SetStatus("背景图已清除");
         }
 
         /// <summary>弹系统的图片选择框。选中返回 true 并把路径写进设置（是否启用由调用方决定）。</summary>
@@ -1287,7 +1287,7 @@ namespace TileBoard
             ApplyAppearance(new WindowInteropHelper(this).Handle);
             QueueSettingsSave();
 
-            SetStatus(_ui.Acrylic ? "毛玻璃已启用" : "毛玻璃已关闭，只剩半透明");
+            SetStatus(_ui.Acrylic ? "毛玻璃已启用" : "毛玻璃已关闭");
         }
 
         private void WidthSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -1380,7 +1380,7 @@ namespace TileBoard
             }
 
             if (want && Services.Autostart.LastUsedRunKeyFallback)
-                SetStatus("已开启，但计划任务被系统拒绝，改用注册表自启（开机后 1~3 分钟才出现）");
+                SetStatus("已开启，开机后可能延迟 1~3 分钟");
             else
                 SetStatus(want ? "已设为开机自启" : "已取消开机自启");
         }
@@ -1517,7 +1517,7 @@ namespace TileBoard
             UpdateGroupLayout();
 
             if (FullScreenCheck != null) FullScreenCheck.IsChecked = _ui.FullScreen;
-            SetStatus(_ui.FullScreen ? "磁贴板已全屏" : "已退出全屏，可拖边框调整大小");
+            SetStatus(_ui.FullScreen ? "磁贴板已全屏" : "已退出全屏");
         }
 
         /// <summary>双击右边缘：满屏宽度 ↔ 上次的宽度。</summary>
@@ -8034,7 +8034,7 @@ namespace TileBoard
 
             Save();
             RenderAll();
-            SetStatus("已新建空白磁贴：右键它可设置图片、颜色、启动目标");
+            SetStatus("已新建空白磁贴");
         }
 
         /// <summary>

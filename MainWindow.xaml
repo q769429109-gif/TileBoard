@@ -59,7 +59,7 @@
                             Content="&#xE700;" ToolTip="所有应用（Win10 字母表）"
                             Click="BtnApps_Click"/>
                     <Button x:Name="BtnLibrary" Style="{StaticResource RailButton}"
-                            Content="&#xE8F1;" ToolTip="应用库：字母排序，拖到右边即成磁贴"
+                            Content="&#xE8F1;" ToolTip="应用库"
                             Click="BtnLibrary_Click"/>
                 </StackPanel>
 
@@ -166,8 +166,6 @@
 
                         <TextBlock Text="个性化" FontSize="24" FontWeight="SemiBold"
                                    Foreground="White"/>
-                        <TextBlock Text="背景、毛玻璃、尺寸与启动方式都在这一页"
-                                   FontSize="12.5" Foreground="#9A9A9A" Margin="0,5,0,0"/>
 
                         <Border Height="1" Background="#1FFFFFFF" Margin="0,20,0,22"/>
 
@@ -178,10 +176,9 @@
                         <CheckBox x:Name="BackdropCheck" Content="自定义背景图片"
                                   Style="{StaticResource SettingCheck}"
                                   FontSize="12.5"
+                                  ToolTip="用一张图铺满磁贴板"
                                   Checked="BackdropCheck_Changed"
                                   Unchecked="BackdropCheck_Changed"/>
-                        <TextBlock Text="开 = 用一张图铺满整个磁贴板；关 = 只留下面的半透明底色。"
-                                   FontSize="11" Foreground="#858585" Margin="0,4,0,0"/>
 
                         <StackPanel Orientation="Horizontal" Margin="0,10,0,0">
                             <Button x:Name="BtnPickBackdrop" Content="选择图片…"
@@ -203,16 +200,15 @@
                         <Slider x:Name="OpacitySlider" Minimum="15" Maximum="100" Value="65"
                                 Style="{StaticResource SettingSlider}"
                                 Margin="0,4,0,0" ValueChanged="OpacitySlider_ValueChanged"/>
-                        <TextBlock Text="越低，底下的桌面透得越多；用了背景图时它控制图片上那层暗色的浓度。"
+                        <TextBlock Text="越低越透"
                                    FontSize="11" Foreground="#858585" Margin="0,4,0,0"/>
 
                         <CheckBox x:Name="AcrylicCheck" Content="启用毛玻璃"
                                   Style="{StaticResource SettingCheck}"
                                   FontSize="12.5" Margin="0,16,0,0"
+                                  ToolTip="系统模糊；关掉是纯半透明"
                                   Checked="AcrylicCheck_Changed"
                                   Unchecked="AcrylicCheck_Changed"/>
-                        <TextBlock Text="开 = 系统 DWM 模糊（Win10 透明效果同款）；关 = 纯半透明。"
-                                   FontSize="11" Foreground="#858585" Margin="0,4,0,0"/>
 
                         <Grid Margin="0,16,0,0">
                             <TextBlock Text="滚动惯性" FontSize="12.5" Foreground="#DCDCDC"/>
@@ -222,7 +218,7 @@
                         <Slider x:Name="InertiaSlider" Minimum="0" Maximum="100" Value="45"
                                 Style="{StaticResource SettingSlider}"
                                 Margin="0,4,0,0" ValueChanged="InertiaSlider_ValueChanged"/>
-                        <TextBlock Text="滚轮停了之后板面继续滑的那段。0 = 关闭，滚到哪停哪；越大滑得越远。"
+                        <TextBlock Text="0 关闭，越大滑得越远"
                                    FontSize="11" Foreground="#858585" Margin="0,4,0,0"/>
 
                         <Border Height="1" Background="#1FFFFFFF" Margin="0,24,0,22"/>
@@ -261,7 +257,7 @@
                                   Checked="FullWidthCheck_Changed"
                                   Unchecked="FullWidthCheck_Changed"/>
 
-                        <TextBlock Text="全屏时宽高跟随屏幕，上面两个滑块会暂时失效。也可以直接拖右边缘改宽度、拖上边缘改高度，双击上边缘切全屏。"
+                        <TextBlock Text="拖边缘改尺寸，双击上边缘切全屏"
                                    Foreground="#8E8E8E" FontSize="11" TextWrapping="Wrap"
                                    Margin="0,12,0,0" LineHeight="17"/>
 
@@ -274,11 +270,9 @@
                         <CheckBox x:Name="AutostartCheck" Content="开机自动启动"
                                   Style="{StaticResource SettingCheck}"
                                   FontSize="12.5"
+                                  ToolTip="登录后后台待命，按 Win 键唤出"
                                   Checked="AutostartCheck_Changed"
                                   Unchecked="AutostartCheck_Changed"/>
-                        <TextBlock Text="启动后不弹面板，按 Win 键才出现；写的是当前用户的自启项，不需要管理员权限。"
-                                   FontSize="11" Foreground="#858585" Margin="0,4,0,0" TextWrapping="Wrap"
-                                   LineHeight="17"/>
                     </StackPanel>
                 </ScrollViewer>
             </Grid>
