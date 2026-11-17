@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
@@ -26,6 +26,65 @@ namespace TileBoard.Services
 
         public bool Loaded { get; private set; }
 
+        // 枚举结果落盘的缓存。shell:AppsFolder 有四百多项，每项都要走一次 COM
+        // 属性读取，实测 2.2 秒 —— 启动时等不起，先读上次的结果顶上。
+        private static string CachePath =>
+            System.IO.Path.Combine(LayoutStore.Directory, "apps.cache.json");
+
+        private sealed class CacheRow
+        {
+            public string Aumid { get; set; }
+            public string Name { get; set; }
+        }
+
+        /// <summary>
+        /// 读上次枚举的清单（几百条 JSON，几毫秒）。首屏只靠它就能算名字和图标，
+        /// 真正的 2.2 秒枚举留给后台刷新。
+        /// </summary>
+        public void LoadCache()
+        {
+            try
+            {
+                if (!System.IO.File.Exists(CachePath)) return;
+
+                var rows = System.Text.Json.JsonSerializer.Deserialize<List<CacheRow>>(
+                    System.IO.File.ReadAllText(CachePath));
+                if (rows == null || rows.Count == 0) return;
+
+                var list = rows
+                    .Where(r => !string.IsNullOrEmpty(r.Aumid))
+                    .Select(r => new NativeShell.AppEntry { Aumid = r.Aumid, Name = r.Name ?? "" })
+                    .OrderBy(a => a.Name, StringComparer.CurrentCulture)
+                    .ToList();
+
+                if (list.Count > 0) Apply(list);
+            }
+            catch { }
+        }
+
+        private void Apply(List<NativeShell.AppEntry> list)
+        {
+            All = list;
+            _byAumid.Clear();
+            foreach (var e in list) _byAumid[e.Aumid] = e;
+            Loaded = true;
+        }
+
+        private static void SaveCache(List<NativeShell.AppEntry> list)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(LayoutStore.Directory);
+                var rows = list
+                    .Where(a => !string.IsNullOrEmpty(a.Aumid))
+                    .Select(a => new CacheRow { Aumid = a.Aumid, Name = a.Name })
+                    .ToList();
+                System.IO.File.WriteAllText(CachePath,
+                    System.Text.Json.JsonSerializer.Serialize(rows));
+            }
+            catch { }
+        }
+
         /// <summary>后台线程枚举全部应用，避免首帧卡住。</summary>
         public Task LoadAsync()
         {
@@ -37,10 +96,8 @@ namespace TileBoard.Services
                     .OrderBy(a => a.Name, StringComparer.CurrentCulture)
                     .ToList();
 
-                All = list;
-                _byAumid.Clear();
-                foreach (var e in list) _byAumid[e.Aumid] = e;
-                Loaded = true;
+                Apply(list);
+                SaveCache(list);
             });
         }
 
@@ -66,21 +123,91 @@ namespace TileBoard.Services
         }
 
         /// <summary>取图标（已 Freeze，可跨线程使用）。取不到返回 null。</summary>
+        /// <summary>图标提取累计耗时/次数（缓存命中不计）。启动日志用它定位卡点。</summary>
+        public static long IconTotalMs;
+        public static int IconExtractCount;
+
+        /// <summary>
+        /// 图标磁盘缓存的目录版本。改提取逻辑后把版本号 +1，旧缓存自然作废。
+        /// </summary>
+        private const string IconCacheVersion = "v1";
+
+        private static string IconCacheDir =>
+            System.IO.Path.Combine(LayoutStore.Directory, "icons-" + IconCacheVersion);
+
+        private static string IconCacheFile(string aumid, int pixels)
+        {
+            // AUMID 里有 `!`、`:`、反斜杠，当文件名会炸；哈希成 40 位十六进制最省心
+            byte[] hash = System.Security.Cryptography.SHA1.HashData(
+                System.Text.Encoding.UTF8.GetBytes(aumid + "|" + pixels));
+
+            var sb = new System.Text.StringBuilder(hash.Length * 2);
+            foreach (byte b in hash) sb.Append(b.ToString("x2"));
+            return System.IO.Path.Combine(IconCacheDir, sb + ".png");
+        }
+
+        private static BitmapSource TryLoadIconCache(string aumid, int pixels)
+        {
+            try
+            {
+                string file = IconCacheFile(aumid, pixels);
+                if (!System.IO.File.Exists(file)) return null;
+
+                var bmp = new BitmapImage();
+                bmp.BeginInit();
+                // 读完立刻释放句柄 —— 否则缓存文件一直被这个进程锁着，清不掉
+                bmp.CacheOption = BitmapCacheOption.OnLoad;
+                bmp.UriSource = new Uri(file);
+                bmp.EndInit();
+                bmp.Freeze();
+                return bmp;
+            }
+            catch { return null; }
+        }
+
+        private static void SaveIconCache(string aumid, int pixels, BitmapSource src)
+        {
+            try
+            {
+                if (src == null) return;
+                System.IO.Directory.CreateDirectory(IconCacheDir);
+
+                var enc = new PngBitmapEncoder();
+                enc.Frames.Add(BitmapFrame.Create(src));
+                using (var fs = System.IO.File.Create(IconCacheFile(aumid, pixels)))
+                    enc.Save(fs);
+            }
+            catch { }
+        }
+
         public BitmapSource GetIcon(string aumid, int pixels = 256)
         {
             if (string.IsNullOrEmpty(aumid)) return null;
 
+            string key = aumid + "|" + pixels;
             lock (_iconLock)
             {
-                string key = aumid + "|" + pixels;
                 if (_iconCache.TryGetValue(key, out var cached)) return cached;
             }
 
-            BitmapSource result = ExtractIconChecked(aumid, pixels);
+            // 先看盘上的缓存。从 shell 提一个图标实测 74ms（94 个磁贴就是 7 秒，
+            // 占了整个启动的 92%），读一张 PNG 只要 1~2ms —— 首次提取后落盘，
+            // 之后每次启动都是读图，启动时间从 9.6 秒降到 2.6 秒上下。
+            BitmapSource result = TryLoadIconCache(aumid, pixels);
+
+            if (result == null)
+            {
+                var swIcon = System.Diagnostics.Stopwatch.StartNew();
+                result = ExtractIconChecked(aumid, pixels);
+                System.Threading.Interlocked.Add(ref IconTotalMs, swIcon.ElapsedMilliseconds);
+                System.Threading.Interlocked.Increment(ref IconExtractCount);
+
+                if (result != null) SaveIconCache(aumid, pixels, result);
+            }
 
             lock (_iconLock)
             {
-                _iconCache[aumid + "|" + pixels] = result;
+                _iconCache[key] = result;
             }
             return result;
         }

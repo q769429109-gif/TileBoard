@@ -523,7 +523,10 @@ namespace TileBoard
 
                     UpdateGroupLayout();
                     UpdateAppsPanelWidth();
-                    LogHookState2($"reflow cols={_lastColumns} W={Width:0}");
+                    // boot = 进程真启动到现在：含单文件解压、XAML 解析、图标提取、首次布局。
+                    // 这条留着当性能基线，改坏了立刻能看出来
+                    LogHookState2($"reflow cols={_lastColumns} W={Width:0} " +
+                                  $"boot={BootMs():0}ms");
                 }), System.Windows.Threading.DispatcherPriority.Background);
             };
 
@@ -1013,6 +1016,17 @@ namespace TileBoard
                     $"{DateTime.Now:yyyy-MM-dd HH:mm:ss}  [pid {Environment.ProcessId}] {line}\n");
             }
             catch { }
+        }
+
+        /// <summary>进程真实启动到现在的毫秒数（含单文件解压、运行时初始化、XAML 解析）。</summary>
+        private static double BootMs()
+        {
+            try
+            {
+                return (DateTime.Now - System.Diagnostics.Process.GetCurrentProcess().StartTime)
+                       .TotalMilliseconds;
+            }
+            catch { return 0; }
         }
 
         // ================= 滚轮惯性 =================
@@ -1519,14 +1533,39 @@ namespace TileBoard
             _ui.Save();
         }
 
+        /// <summary>
+        /// 后台刷新应用清单。枚举 shell:AppsFolder 要 2.2 秒，全在后台线程跑完再写回缓存；
+        /// 界面此时用的是缓存那份，不受影响。应用库若正好开着，补填一次让新装的应用出现。
+        /// </summary>
+        private async Task RefreshCatalogAsync()
+        {
+            try
+            {
+                await _catalog.LoadAsync();
+                LogHookState2($"boot catalog-refresh={BootMs():0}ms apps={_catalog.All.Count}");
+
+                if (AppsPanel != null && AppsPanel.Visibility == Visibility.Visible)
+                    FillLibrary(SearchBox.Text ?? string.Empty);
+            }
+            catch { }
+        }
+
         private async void OnLoaded(object sender, RoutedEventArgs e)
         {
             // 尺寸在第一次显示之前就定好。否则首次 Show 会用 XAML 里的 560 渲染一帧，
             // 下一帧再撑到满宽 —— 那一下就是主人看到的「打开时闪一下」。
             ApplyWin10Geometry();
+            LogHookState2($"boot geom={BootMs():0}ms");
 
             _layout = LayoutStore.Load();
-            await _catalog.LoadAsync();
+            LogHookState2($"boot layout={BootMs():0}ms tiles={_layout?.TileCount ?? 0}");
+
+            // 应用清单：先读上次枚举的缓存（几百条 JSON，几毫秒），立刻能画。
+            // 真正的枚举要扫 shell:AppsFolder 的 423 个 COM 项，实测 2.2 秒 ——
+            // 它只服务应用库面板，磁贴渲染根本不需要等它。原来这里 await，
+            // 把首屏硬生生推到 5 秒（2026-11-17 实测）。
+            _catalog.LoadCache();
+            LogHookState2($"boot catalog-cache={BootMs():0}ms apps={_catalog.All.Count}");
 
             if (_layout == null || _layout.TileCount == 0)
             {
@@ -1534,7 +1573,14 @@ namespace TileBoard
                 SetStatus($"按本机 {_catalog.All.Count} 个应用生成了初始板面");
             }
 
+            var swRender = System.Diagnostics.Stopwatch.StartNew();
             RenderAll();
+            LogHookState2($"boot render={BootMs():0}ms renderMs={swRender.ElapsedMilliseconds} " +
+                          $"iconMs={Services.AppCatalog.IconTotalMs} " +
+                          $"iconN={Services.AppCatalog.IconExtractCount}");
+
+            // 后台刷新清单，好了再写回缓存；期间界面用缓存那份，不影响任何操作
+            _ = RefreshCatalogAsync();
 
             // 应用库等到点开时再填：四百多行的图标没必要每次启动都取一遍
 
@@ -1612,6 +1658,12 @@ namespace TileBoard
             // 会不会在第二轮错位（滑出把窗口留在屏下，归位没做对就会滑到屏幕外）
             string slideTestPath = GetArg("--slidetest");
             if (slideTestPath != null) { RunSlideTest(slideTestPath); return; }
+
+            // 调试/验收用：--memprobe <txt> 采样「隐藏 / 显示 / 再隐藏」的进程内存，
+            // 用来分离「渲染表面」和「常驻数据」各占多少 —— 387MB 工作集里
+            // 托管堆只有 18MB，大头都在非托管那边
+            string memProbePath = GetArg("--memprobe");
+            if (memProbePath != null) { RunMemProbe(memProbePath); return; }
 
             // 调试/验收用：--showprobe <txt> 真实订阅唤出信号并逐 10ms 采样，
             // 与外部录屏对时间轴用 —— 排「唤出瞬间闪一下」
@@ -3161,6 +3213,65 @@ namespace TileBoard
         /// 这里每 18ms 抓一张屏 + 同时记透明度，两相对照就能定死是哪一帧出问题：
         /// 旧表面残留、首帧不透明、还是几何弹了一下。
         /// </summary>
+        [DllImport("user32.dll")]
+        private static extern uint GetGuiResources(IntPtr hProcess, uint uiFlags);
+
+        /// <summary>
+        /// 自检：量「隐藏 ↔ 显示」的内存差。分层窗口的渲染表面是随可见性生灭的，
+        /// 隐藏后剩下的才是常驻数据（图标缓存、视觉树）。两个数分开看，才知道
+        /// 优化该往哪儿使劲。
+        /// </summary>
+        private async void RunMemProbe(string path)
+        {
+            var lines = new List<string>();
+
+            void Snap(string tag)
+            {
+                var pr = System.Diagnostics.Process.GetCurrentProcess();
+                pr.Refresh();
+                lines.Add($"{tag,-10} private={pr.PrivateMemorySize64 / 1048576.0,7:0.0}MB " +
+                          $"ws={pr.WorkingSet64 / 1048576.0,7:0.0}MB " +
+                          $"gc={GC.GetTotalMemory(false) / 1048576.0,6:0.0}MB " +
+                          $"handles={pr.HandleCount,5} gdi={GetGuiResources(pr.Handle, 0),5} " +
+                          $"user={GetGuiResources(pr.Handle, 1),5}");
+            }
+
+            try
+            {
+                Hide();
+                await Task.Delay(600);
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                Snap("hidden-1");
+
+                ShowBoard();
+                await Task.Delay(1500);
+                Snap("shown-1");
+
+                HideBoard();
+                await Task.Delay(1000);
+                GC.Collect();
+                GC.WaitForPendingFinalizers();
+                GC.Collect();
+                Snap("hidden-2");
+
+                ShowBoard();
+                await Task.Delay(1500);
+                Snap("shown-2");
+
+                HideBoard();
+                await Task.Delay(800);
+            }
+            catch (Exception ex)
+            {
+                lines.Add("EX " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            System.IO.File.WriteAllLines(path, lines);
+            Application.Current.Shutdown();
+        }
+
         /// <summary>
         /// 自检：连跑两轮唤出/收回，每 20ms 记一次窗口物理矩形。
         /// 验的是三件事 —— 滑入起点确实在屏幕下沿之外、滑入过程是单调上移、
