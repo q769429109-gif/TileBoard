@@ -207,8 +207,82 @@ namespace TileBoard
         // 其余所有几何计算一律用 WorkArea()（即 _screen.Dip），不再碰主屏专属的 SystemParameters.WorkArea
         private Native.Screens.Info _screen;
 
+        // —— 唤出时带出任务栏 ——
+        // 任务栏和板面同在置顶层，板面一 Show 再 Activate 就压到任务栏前面；
+        // 自动隐藏的任务栏更是不会弹（鼠标移到底边命中的是板面）。
+        // 唤出前把任务栏提到最前，处于自动隐藏时临时取消（收板面还原），
+        // 并从工作区里让出它占的那一条 —— 板面与任务栏谁都不遮谁。
+        private readonly List<IntPtr> _trayWindows = new List<IntPtr>();
+        private bool _taskbarAutoHideSuspended;
+        private double _taskbarReserveDip;
+
         /// <summary>当前停靠屏的工作区（DIP）。_screen 还没就绪时退回主屏。</summary>
-        private Rect WorkArea() => _screen?.Dip ?? SystemParameters.WorkArea;
+        private Rect WorkArea()
+        {
+            Rect work = _screen?.Dip ?? SystemParameters.WorkArea;
+
+            // 自动隐藏的任务栏被临时叫出来时会占住底部一条，板面得让开
+            if (_taskbarReserveDip > 0 && work.Height > _taskbarReserveDip + 200)
+                work.Height -= _taskbarReserveDip;
+
+            return work;
+        }
+
+        /// <summary>
+        /// 把这块屏的任务栏带到前面来。必须在 ApplyWin10Geometry 之前调用 ——
+        /// 它决定了 WorkArea() 要不要给任务栏留一条位置。
+        /// </summary>
+        private void BringOutTaskbar(IntPtr monitor)
+        {
+            _trayWindows.Clear();
+            _taskbarReserveDip = 0;
+
+            double scale = 96.0 / (_screen?.Dpi ?? 96);
+            Rect work = _screen?.Dip ?? SystemParameters.WorkArea;
+
+            // 自动隐藏的任务栏在「没弹出」时是滑到屏幕外的，光置顶看不见，得先取消自动隐藏
+            bool autoHide = Native.Taskbar.IsAutoHide();
+            if (autoHide && Native.Taskbar.SetAutoHide(false))
+                _taskbarAutoHideSuspended = true;
+
+            foreach (IntPtr tray in Native.Taskbar.ForMonitor(monitor))
+            {
+                _trayWindows.Add(tray);
+                Native.Taskbar.BringToFront(tray);
+
+                // 常显任务栏：工作区本来就排除它了，不用再让位
+                if (!_taskbarAutoHideSuspended) continue;
+                if (!Native.Taskbar.TryGetRect(tray, out Rect r)) continue;
+
+                // 只处理底部任务栏；顶部/侧边任务栏不占板面底部，工作区也已经让开
+                if (r.Top * scale < work.Bottom - 60) continue;
+
+                double hDip = r.Height * scale;
+                if (hDip >= 20 && hDip <= 120 && hDip > _taskbarReserveDip)
+                    _taskbarReserveDip = hDip;
+            }
+
+            LogHookState2($"taskbar mon=0x{monitor.ToInt64():X} n={_trayWindows.Count} " +
+                          $"autohide={autoHide} reserve={_taskbarReserveDip:0}");
+        }
+
+        /// <summary>再提一次（Show + Activate 之后板面可能又跑到前面去了）。</summary>
+        private void RefrontTaskbar()
+        {
+            foreach (IntPtr tray in _trayWindows) Native.Taskbar.BringToFront(tray);
+        }
+
+        /// <summary>收板面时还原任务栏的自动隐藏设置——改的是系统设置，必须成对还回去。</summary>
+        private void RestoreTaskbar()
+        {
+            if (_taskbarAutoHideSuspended)
+            {
+                Native.Taskbar.SetAutoHide(true);
+                _taskbarAutoHideSuspended = false;
+            }
+            _trayWindows.Clear();
+            _taskbarReserveDip = 0;
+        }
 
         // 板面重排防抖令牌：跨屏 DPI 切换时 WPF 会临时改写窗口宽高（见 OnDpiChanged），
         // 中间尺寸量出来的列数是假的，只有最后一次 SizeChanged 才是尘埃落定的真宽度
@@ -614,27 +688,181 @@ namespace TileBoard
         /// </summary>
         private void ApplyAppearance(IntPtr handle)
         {
-            // 1) 面板底色：alpha 直接由「背景透明度」决定 —— 这层同时是亚克力上的染色
+            // 1) 底色：alpha 直接由「背景透明度」决定 —— 这层同时是亚克力上的染色。
+            //    整窗只有这一层底色（WindowBackdrop），板面 / 设置页 / 手机页都让空，
+            //    所以换背景图只改这里，三个页面自动一致。
             byte a = (byte)Math.Round(255 * Math.Clamp(_ui.BackOpacity, 0.15, 1.0));
-            var back = new SolidColorBrush(Color.FromArgb(a, 0x1B, 0x1B, 0x1B));
 
-            BoardSurface.Background = back;
-
-            // 设置页 / 手机页是整页，底色必须跟板面一模一样，否则切页时会「暗一下」
-            if (SettingsPage != null) SettingsPage.Background = back;
-            if (PhonePage != null) PhonePage.Background = back;
+            // 2) 自定义背景图：铺在底色之下。有图时暗色层减半 ——
+            //    默认 0.74 的浓度会把图片直接糊死，看着像「开关没生效」
+            bool hasImage = ApplyBackdrop();
+            byte tint = hasImage ? (byte)Math.Round(a * 0.45) : a;
+            BackdropTint.Background = new SolidColorBrush(Color.FromArgb(tint, 0x1B, 0x1B, 0x1B));
 
             if (!_ui.Acrylic)
             {
                 // 总开关关掉：什么模糊都不要，背后是清晰桌面
                 Native.Acrylic.Off(handle);
-                LogHookState2($"Acrylic=off  opacity={_ui.BackOpacity:0.00}");
+                LogHookState2($"Acrylic=off  opacity={_ui.BackOpacity:0.00} backdrop={(hasImage ? "image" : "solid")}");
                 return;
             }
 
-            // 2) 开：DWM 亚克力。tint 全透明（alpha=0）—— 模糊归 DWM，染色归上面那层底色
+            // 3) 开：DWM 亚克力。tint 全透明（alpha=0）—— 模糊归 DWM，染色归上面那层底色
             bool ok = Native.Acrylic.Enable(handle, 0);
-            LogHookState2($"Acrylic={(ok ? "on" : "failed")} (system)  opacity={_ui.BackOpacity:0.00}");
+            LogHookState2($"Acrylic={(ok ? "on" : "failed")} (system)  opacity={_ui.BackOpacity:0.00} " +
+                          $"backdrop={(hasImage ? "image" : "solid")}");
+        }
+
+        // 背景图解码缓存：同一个路径反复 ApplyAppearance（拖滑块每次都调）不该反复读盘
+        private string _backdropLoadedPath;
+        private BitmapSource _backdropLoaded;
+
+        /// <summary>开关开着且有可读文件：图片是真的铺上去了吗。</summary>
+        private bool HasBackdropFile()
+        {
+            return _ui.CustomBackdrop &&
+                   !string.IsNullOrWhiteSpace(_ui.BackdropPath) &&
+                   System.IO.File.Exists(_ui.BackdropPath);
+        }
+
+        /// <summary>按设置铺背景图，返回「这次是不是真的有图」。失败一律退回纯色，不弹错。</summary>
+        private bool ApplyBackdrop()
+        {
+            if (!HasBackdropFile())
+            {
+                BackdropImage.Source = null;
+                BackdropImage.Visibility = Visibility.Collapsed;
+                _backdropLoaded = null;
+                _backdropLoadedPath = null;
+                return false;
+            }
+
+            try
+            {
+                if (!string.Equals(_backdropLoadedPath, _ui.BackdropPath, StringComparison.OrdinalIgnoreCase)
+                    || BackdropImage.Source == null)
+                {
+                    _backdropLoaded = LoadBackdropImage(_ui.BackdropPath);
+                    _backdropLoadedPath = _ui.BackdropPath;
+                    BackdropImage.Source = _backdropLoaded;
+                }
+
+                BackdropImage.Visibility = Visibility.Visible;
+                return true;
+            }
+            catch
+            {
+                // 文件坏了、格式不支持（比如某些 webp）：退回纯色底，板面照常能用
+                BackdropImage.Source = null;
+                BackdropImage.Visibility = Visibility.Collapsed;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 读背景图。CacheOption=OnLoad：立刻把文件读完并释放句柄 ——
+        /// 否则用户删/改这张图时会被我们锁住，删不掉。
+        /// </summary>
+        private static BitmapSource LoadBackdropImage(string path)
+        {
+            var bmp = new BitmapImage();
+            bmp.BeginInit();
+            bmp.CacheOption = BitmapCacheOption.OnLoad;
+            bmp.CreateOptions = BitmapCreateOptions.IgnoreColorProfile;
+            bmp.UriSource = new Uri(path, UriKind.Absolute);
+            // 4K 壁纸也没必要按原尺寸全解进内存，2560 宽足够铺满任何单屏
+            bmp.DecodePixelWidth = 2560;
+            bmp.EndInit();
+            bmp.Freeze();
+            return bmp;
+        }
+
+        /// <summary>把背景相关的控件对到当前设置。</summary>
+        private void SyncBackdropControls()
+        {
+            if (BackdropCheck == null) return;
+
+            BackdropCheck.IsChecked = _ui.CustomBackdrop;
+            if (BackdropPathText != null)
+            {
+                BackdropPathText.Text = HasBackdropFile()
+                    ? System.IO.Path.GetFileName(_ui.BackdropPath)
+                    : "未选择图片";
+                BackdropPathText.ToolTip = HasBackdropFile() ? _ui.BackdropPath : null;
+            }
+        }
+
+        private void BackdropCheck_Changed(object sender, RoutedEventArgs e)
+        {
+            if (!_appearanceReady) return;
+
+            bool want = BackdropCheck.IsChecked == true;
+
+            // 开着却还没有图：直接把选择框弹出来，别让这个开关点了像没反应
+            if (want && !HasBackdropFile())
+            {
+                if (!PickBackdrop())
+                {
+                    _appearanceReady = false;
+                    BackdropCheck.IsChecked = false;
+                    _appearanceReady = true;
+                    return;
+                }
+            }
+
+            _ui.CustomBackdrop = want;
+            SyncBackdropControls();
+            ApplyAppearance(new WindowInteropHelper(this).Handle);
+            QueueSettingsSave();
+        }
+
+        private void BtnPickBackdrop_Click(object sender, RoutedEventArgs e)
+        {
+            if (!PickBackdrop()) return;
+
+            _ui.CustomBackdrop = true;
+            SyncBackdropControls();
+            ApplyAppearance(new WindowInteropHelper(this).Handle);
+            QueueSettingsSave();
+            SetStatus("背景图已换：" + System.IO.Path.GetFileName(_ui.BackdropPath));
+        }
+
+        private void BtnClearBackdrop_Click(object sender, RoutedEventArgs e)
+        {
+            _ui.CustomBackdrop = false;
+            _ui.BackdropPath = "";
+            SyncBackdropControls();
+            ApplyAppearance(new WindowInteropHelper(this).Handle);
+            QueueSettingsSave();
+            SetStatus("背景图已清除，回到纯色底");
+        }
+
+        /// <summary>弹系统的图片选择框。选中返回 true 并把路径写进设置（是否启用由调用方决定）。</summary>
+        private bool PickBackdrop()
+        {
+            var dlg = new Microsoft.Win32.OpenFileDialog
+            {
+                Title = "选择磁贴板背景图片",
+                Filter = "图片文件|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.tif;*.tiff;*.webp|所有文件|*.*",
+                CheckFileExists = true
+            };
+
+            if (HasBackdropFile())
+            {
+                try { dlg.InitialDirectory = System.IO.Path.GetDirectoryName(_ui.BackdropPath); }
+                catch { }
+            }
+
+            // 系统对话框会让板面失焦，按下自动隐藏的话框一弹板面就没了
+            bool? ok;
+            _suppressHide = true;
+            try { ok = dlg.ShowDialog(this); }
+            finally { _suppressHide = false; }
+
+            if (ok != true) return false;
+
+            _ui.BackdropPath = dlg.FileName;
+            return true;
         }
 
         /// <summary>把外观相关的结果也写进同一份日志，方便排查「为什么看着不透明」。</summary>
@@ -763,6 +991,7 @@ namespace TileBoard
             FullScreenCheck.IsChecked = _ui.FullScreen;
             AcrylicCheck.IsChecked = _ui.Acrylic;
             InertiaSlider.Value = Math.Round(Math.Clamp(_ui.ScrollInertia, 0, 100));
+            SyncBackdropControls();
 
             SyncSizeControls();
             AutostartCheck.IsChecked = Services.Autostart.IsEnabled();
@@ -1353,6 +1582,10 @@ namespace TileBoard
             // 临时自检：--foldertest <txt> 文件夹的建立 / 菜单移出 / 只剩一块自动解散
             string folderTest = GetArg("--foldertest");
             if (folderTest != null) { await RunFolderTakeOutTest(folderTest); return; }
+
+            // 临时自检：--backdroptest <outBase> 自定义背景图 + 唤出时的任务栏处理
+            string backdropTest = GetArg("--backdroptest");
+            if (backdropTest != null) { await RunBackdropTest(backdropTest); return; }
 
             // 调试/验收用：--shot <路径> 让应用把自身界面渲染成 PNG 后退出
             string shotPath = GetShotPath();
@@ -3602,9 +3835,55 @@ namespace TileBoard
             return null;
         }
 
-        private async Task CaptureAndExit(string path)
+        /// <summary>
+        /// 自检：设一张自定义背景图、唤出板面，把「图片是否铺上、三页是否统一、
+        /// 任务栏有没有被带出来」一并记账并存两张图。
+        /// </summary>
+        private async Task RunBackdropTest(string outBase)
         {
-            await Task.Delay(2500);   // 等图标与布局稳定
+            var lines = new List<string>();
+
+            await Task.Delay(600);
+
+            const string img = @"D:\WorkBuddy\2026-11-15-23-51-04\testbackdrop.png";
+            _ui.CustomBackdrop = true;
+            _ui.BackdropPath = img;
+
+            // 窗口已被 StartupUri 摆上来了，ShowBoard 会因 IsVisible 直接早退 ——
+            // 先收掉，走一遍真实的唤出路径（任务栏也在那条路上）
+            Hide();
+            ApplyAppearance(new WindowInteropHelper(this).Handle);
+            ShowBoard();
+            await Task.Delay(1200);
+
+            var src = BackdropImage.Source as BitmapSource;
+            lines.Add($"backdrop on={_ui.CustomBackdrop} file={System.IO.File.Exists(img)}");
+            lines.Add($"image={(src == null ? "null" : src.PixelWidth + "x" + src.PixelHeight)} " +
+                      $"vis={BackdropImage.Visibility}");
+            lines.Add($"tintAlpha={((SolidColorBrush)BackdropTint.Background).Color.A}");
+            lines.Add($"tray n={_trayWindows.Count} suspended={_taskbarAutoHideSuspended} " +
+                      $"reserve={_taskbarReserveDip:0}");
+            lines.Add($"tray hwnd={string.Join(",", _trayWindows.Select(h => h.ToInt64().ToString("X")))}");
+            lines.Add($"geom={Left:0},{Top:0} {Width:0}x{Height:0} work={WorkArea()}");
+
+            RevealForCapture();
+            await Task.Delay(400);
+            SaveRootPng(outBase + "-board.png");
+
+            // 设置页也要看到同一张图：背景层是整窗唯一的，理论上三页必然一致
+            ShowSettingsPage();
+            await Task.Delay(700);
+            SaveRootPng(outBase + "-settings.png");
+
+            lines.Add($"settingsPage vis={SettingsPage.Visibility} " +
+                      $"bg={(SettingsPage.Background as SolidColorBrush)?.Color.ToString() ?? "非纯色"}");
+
+            try { System.IO.File.WriteAllText(outBase + ".txt", string.Join("\n", lines)); } catch { }
+            Application.Current.Shutdown();
+        }
+
+        private async Task CaptureAndExit(string path)
+        {            await Task.Delay(2500);   // 等图标与布局稳定
             RevealForCapture();
             SaveRootPng(path);
             Application.Current.Shutdown();
@@ -3866,6 +4145,10 @@ namespace TileBoard
                 }
             }
 
+            // 屏幕定下来了，先把这块屏的任务栏带到前面（自动隐藏的顺手叫出来），
+            // 再算几何 —— WorkArea() 会按它让出一条，板面和任务栏不会互相遮
+            BringOutTaskbar(_screen?.Monitor ?? IntPtr.Zero);
+
             // 尺寸只在真的变了才改，避免无谓的重建
             Rect work = WorkArea();
             double wantW = Math.Clamp(_ui.PanelWidth > 0 ? _ui.PanelWidth : 560,
@@ -3890,6 +4173,10 @@ namespace TileBoard
             Activate();
             SetForegroundWindow(new WindowInteropHelper(this).Handle);
             _shownAt = DateTime.UtcNow;
+
+            // Show + Activate 会让板面重新排到置顶层最前，任务栏再提一次 ——
+            // 用户要的是「唤出磁贴板时任务栏一起出来」，不是被板面压回去
+            RefrontTaskbar();
 
             // 诊断闪烁：Show 落定后的真实物理矩形。它若和 summon 日志里的目标几何不一致，
             // 就是 WPF 在可见之后还在动窗口 —— 闪一下就发生在这一步
@@ -3978,6 +4265,10 @@ namespace TileBoard
                 // 窗口隐藏后不上屏，置顶属性没有任何副作用。
                 _hiding = false;
                 Hide();
+
+                // 板面真的收完了才还原任务栏的自动隐藏设置：中途又被唤出的话，
+                // token 对不上会提前 return，任务栏应该保持被叫出来的状态
+                RestoreTaskbar();
             };
 
             RootGrid.BeginAnimation(OpacityProperty, fade);
@@ -3997,6 +4288,9 @@ namespace TileBoard
         private void OnClosing(object sender, System.ComponentModel.CancelEventArgs e)
         {
             LogHookState2("Closing fired —— 主窗口正在关闭");
+
+            // 退出前务必还原任务栏：唤出期间若临时取消过自动隐藏，这里是最后一道保险
+            RestoreTaskbar();
 
             UnregisterHotKey(new WindowInteropHelper(this).Handle, HotkeyId);
             _hookWatch?.Dispose();

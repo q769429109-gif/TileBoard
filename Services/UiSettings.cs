@@ -25,6 +25,12 @@ namespace TileBoard.Services
         /// <summary>滚轮惯性 0 ~ 100。0 = 关（跟手停）；越大，滚轮停了之后板面继续滑得越远。</summary>
         public double ScrollInertia { get; set; } = 45;
 
+        /// <summary>是否用自定义图片当板面背景。关着时按原来的半透明底色走。</summary>
+        public bool CustomBackdrop { get; set; }
+
+        /// <summary>自定义背景图的完整路径。文件被删/挪走时自动退回纯色底，不报错。</summary>
+        public string BackdropPath { get; set; } = "";
+
         private static readonly JsonSerializerOptions Options = new JsonSerializerOptions { WriteIndented = true };
 
         private static string FilePath => Path.Combine(LayoutStore.Directory, "settings.json");
