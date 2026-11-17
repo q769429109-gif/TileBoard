@@ -75,12 +75,17 @@ namespace TileBoard
                 return;
             }
 
+            // 常驻实例才需要取证。自检进程跑完就走，写心跳只是噪音。
+            if (!selfTest) Native.CrashGuard.Start();
+
             base.OnStartup(e);
         }
 
         protected override void OnExit(ExitEventArgs e)
         {
             Log("APP EXIT code=" + e.ApplicationExitCode + " (正常退出路径)");
+            // 删掉会话标记 —— 下次启动若还看到它，就说明这一轮是被硬杀的
+            Native.CrashGuard.Stop("code=" + e.ApplicationExitCode);
             base.OnExit(e);
         }
 
