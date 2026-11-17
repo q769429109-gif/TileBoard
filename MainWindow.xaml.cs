@@ -197,6 +197,12 @@ namespace TileBoard
         // 中间尺寸量出来的列数是假的，只有最后一次 SizeChanged 才是尘埃落定的真宽度
         private int _layoutReflowToken;
 
+        // 中键拖拽平移板面的记账：按下时的光标位置和滚动偏移，拖动中反推新偏移
+        private bool _panning;
+        private Point _panOrigin;
+        private double _panH;
+        private double _panV;
+
         // 右边缘拖拽改宽度
         private bool _resizing;
         private double _resizeStartX;
@@ -283,6 +289,38 @@ namespace TileBoard
                     UpdateAppsPanelWidth();
                     LogHookState2($"reflow cols={_lastColumns} W={Width:0}");
                 }), System.Windows.Threading.DispatcherPriority.Background);
+            };
+
+            // 中键拖拽平移板面：按住中键拖，横竖两个方向都跟手（CAD / 浏览器同款手势）。
+            // 全部用 Preview 事件 —— 磁贴、分组块谁也别想把中键半路截走；
+            // CaptureMouse 保证拖出窗口外也持续跟踪，松键才停。
+            BoardScroll.PreviewMouseDown += (s, e) =>
+            {
+                if (e.ChangedButton != MouseButton.Middle) return;
+                _panOrigin = e.GetPosition(BoardScroll);
+                _panH = BoardScroll.HorizontalOffset;
+                _panV = BoardScroll.VerticalOffset;
+                _panning = true;
+                Cursor = Cursors.ScrollAll;
+                BoardScroll.CaptureMouse();
+                e.Handled = true;
+            };
+            BoardScroll.PreviewMouseMove += (s, e) =>
+            {
+                if (!_panning) return;
+                var p = e.GetPosition(BoardScroll);
+                // 内容跟手反着走：光标往右拖，视野往左挪 —— 和拖地图一个方向感
+                BoardScroll.ScrollToHorizontalOffset(_panH - (p.X - _panOrigin.X));
+                BoardScroll.ScrollToVerticalOffset(_panV - (p.Y - _panOrigin.Y));
+                e.Handled = true;
+            };
+            BoardScroll.PreviewMouseUp += (s, e) =>
+            {
+                if (e.ChangedButton != MouseButton.Middle || !_panning) return;
+                _panning = false;
+                Cursor = null;
+                BoardScroll.ReleaseMouseCapture();
+                e.Handled = true;
             };
 
             // 窗口尺寸/位置一动，垫底那张桌面图就得跟着挪，否则全屏时会整体错位
@@ -3447,12 +3485,35 @@ namespace TileBoard
             HideSettingsPage(false);
             HidePhonePage();
 
-            // 多屏方案改版：面板不再跨屏跳动。跨屏 = DPI 重缩放 + 几何重提交，
-            // 闪一下还牵连整板重排 —— 这些坑全趟过了。
-            // 现在面板始终停在它自己所在的那块屏（启动即在主屏），
-            // 多屏需求交给横向位置条：板面内容可以比面板宽，滑过去看。
-            if (Native.Screens.TryOfWindow(new WindowInteropHelper(this).Handle, out Native.Screens.Info winScreen))
-                _screen = winScreen;
+            // 多屏：鼠标在哪块屏上按的唤出键，面板就出在哪块屏（Win10 开始菜单同款逻辑）。
+            // 当初砍掉跨屏跳是因为以为闪在几何层，现在真凶（Topmost Z 序切换）已修，
+            // 三个旧病根各有防线：
+            //   ① Topmost Z 序切换 → 已永久置顶，不再每次唤出重排；
+            //   ② WPF 对隐藏窗口的 Left/Top 提交时机不可信 → 下面先物理 SetWindowPos 预挪，
+            //      DPI 折算、自动缩放、OnDpiChanged 纠偏全部消化在不可见阶段；
+            //   ③ 布局被重排毁掉 → Normalize / GroupCanvas 已不再夹任何已摆放的组，
+            //      装不下的组滚出视口，交给横向位置条。
+            if (Native.Screens.TryNearCursor(out Native.Screens.Info picked))
+            {
+                bool screenChanged = _screen == null || picked.Monitor != _screen.Monitor;
+                _screen = picked;
+
+                if (screenChanged)
+                {
+                    // ShowBoard 入口保证此刻窗口必然隐藏：物理预挪到目标屏，
+                    // 让 DPI 切换的整场抖动发生在见人之前（首帧即正确几何）
+                    IntPtr hwndPre = new WindowInteropHelper(this).Handle;
+                    if (hwndPre != IntPtr.Zero)
+                        SetWindowPos(hwndPre, IntPtr.Zero,
+                                     (int)picked.Physical.Left, (int)picked.Physical.Top,
+                                     0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+                    ApplyWin10Geometry();
+                    LogHookState2($"summon mon={picked.Monitor.ToInt64():X} dpi={picked.Dpi} " +
+                                  $"dip={picked.Dip.Width:0}x{picked.Dip.Height:0} " +
+                                  $"geom L={Left:0} T={Top:0} W={Width:0} H={Height:0}");
+                }
+            }
 
             // 尺寸只在真的变了才改，避免无谓的重建
             Rect work = WorkArea();
