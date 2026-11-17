@@ -130,7 +130,7 @@ namespace TileBoard.Services
         /// <summary>
         /// 图标磁盘缓存的目录版本。改提取逻辑后把版本号 +1，旧缓存自然作废。
         /// </summary>
-        private const string IconCacheVersion = "v1";
+        private const string IconCacheVersion = "v2";
 
         private static string IconCacheDir =>
             System.IO.Path.Combine(LayoutStore.Directory, "icons-" + IconCacheVersion);
@@ -342,20 +342,17 @@ namespace TileBoard.Services
             try
             {
                 string lcDir = System.IO.Path.Combine(root, "appcache", "librarycache", appid);
+                bool haveCache = System.IO.Directory.Exists(lcDir);
 
-                // 1) 小尺寸：librarycache 里那张 40 位十六进制名的方图（32x32 原生，最清晰）
-                if (pixels <= 48 && System.IO.Directory.Exists(lcDir))
-                {
-                    foreach (var f in System.IO.Directory.EnumerateFiles(lcDir, "*.jpg"))
-                    {
-                        string name = System.IO.Path.GetFileNameWithoutExtension(f);
-                        if (name.Length == 40 && IsHex(name))
-                            return LoadImageFile(f, pixels);
-                    }
-                }
+                // 方图是唯一来源：应用库和磁贴必须显示同一张图。
+                // 之前大尺寸改走「游戏目录里体积最大的 exe」，而 Unity 游戏的
+                // UnityCrashHandler64.exe 往往最大 —— 磁贴上就成了白色立方体，
+                // 和应用库里的游戏标志完全对不上。用户要求以应用库为准，改回来。
+                string square = haveCache ? FindSteamSquare(lcDir) : null;
+                if (square != null) return LoadImageFile(square, pixels);
 
-                // 2) 游戏本体 exe 的图标资源：libraryfolders.vdf 列出所有库 →
-                //    appmanifest_<appid>.acf 的 installdir → common\<installdir> 里的 exe
+                // 缓存目录里没有方图（游戏没被 Steam 缓存过）：退回 exe，
+                // 但排掉崩溃器/卸载器，别再把别的程序的图标顶上来
                 string vdf = System.IO.Path.Combine(root, "steamapps", "libraryfolders.vdf");
                 if (System.IO.File.Exists(vdf))
                 {
@@ -380,6 +377,7 @@ namespace TileBoard.Services
 
                         // 主 exe 通常是体积最大的那个，试前三个
                         var exes = System.IO.Directory.EnumerateFiles(gameDir, "*.exe")
+                            .Where(f => !IsJunkExe(f))
                             .OrderByDescending(f => new System.IO.FileInfo(f).Length)
                             .Take(3);
 
@@ -393,16 +391,67 @@ namespace TileBoard.Services
                     }
                 }
 
-                // 3) logo.png（640x360 透明底 logo，最后的选择）
-                if (System.IO.Directory.Exists(lcDir))
+                // 最后：logo（透明底艺术字）
+                string logo = haveCache ? FindSteamLogo(lcDir) : null;
+                if (logo != null)
                 {
-                    string logo = System.IO.Path.Combine(lcDir, "logo.png");
-                    if (System.IO.File.Exists(logo)) return LoadImageFile(logo, pixels);
+                    var lg = LoadImageFile(logo, pixels);
+                    if (lg != null) return lg;
                 }
             }
             catch { /* Steam 数据读不动就走常规兜底 */ }
 
             return null;
+        }
+
+        /// <summary>librarycache 里那张 40 位十六进制命名的方图（原生 32x32）。</summary>
+        private static string FindSteamSquare(string lcDir)
+        {
+            try
+            {
+                foreach (var f in System.IO.Directory.EnumerateFiles(lcDir, "*.jpg"))
+                {
+                    string name = System.IO.Path.GetFileNameWithoutExtension(f);
+                    if (name.Length == 40 && IsHex(name)) return f;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private static string FindSteamLogo(string lcDir)
+        {
+            try
+            {
+                string direct = System.IO.Path.Combine(lcDir, "logo.png");
+                if (System.IO.File.Exists(direct)) return direct;
+
+                foreach (var f in System.IO.Directory.EnumerateFiles(
+                             lcDir, "*", System.IO.SearchOption.AllDirectories))
+                {
+                    string fn = System.IO.Path.GetFileName(f);
+                    if (fn.StartsWith("logo", StringComparison.OrdinalIgnoreCase) &&
+                        fn.EndsWith(".png", StringComparison.OrdinalIgnoreCase))
+                        return f;
+                }
+            }
+            catch { }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 这些 exe 的图标不属于游戏本体：Unity 的崩溃器是白色立方体，卸载器和运行库
+        /// 安装器各带自己的标志。按体积倒序时它们经常排在最前，直接顶掉真图标。
+        /// </summary>
+        private static bool IsJunkExe(string path)
+        {
+            string n = System.IO.Path.GetFileNameWithoutExtension(path);
+            foreach (string bad in new[] { "crash", "handler", "unins", "redist",
+                                           "setup", "report", "diagnostic" })
+                if (n.IndexOf(bad, StringComparison.OrdinalIgnoreCase) >= 0)
+                    return true;
+            return false;
         }
 
         private static bool IsHex(string s)
@@ -420,7 +469,14 @@ namespace TileBoard.Services
                 var bi = new System.Windows.Media.Imaging.BitmapImage();
                 bi.BeginInit();
                 bi.CacheOption = System.Windows.Media.Imaging.BitmapCacheOption.OnLoad;
-                bi.DecodePixelWidth = Math.Max(16, pixels);
+
+                // 只在「缩小」时按目标宽度解码，省内存。源本来就比目标小（Steam 的
+                // 方图只有 32px）就保持原尺寸，放大交给 Image 那边的 HighQuality —
+                // 解码器的插值比 WPF 的 Fant 糙，先放大一次再缩放会糊两层。
+                int srcW = SourcePixelWidth(path);
+                if (srcW <= 0 || srcW > pixels)
+                    bi.DecodePixelWidth = Math.Max(16, pixels);
+
                 bi.UriSource = new Uri(path);
                 bi.EndInit();
                 bi.Freeze();
@@ -430,6 +486,21 @@ namespace TileBoard.Services
             {
                 return null;
             }
+        }
+
+        /// <summary>只解析文件头拿宽度，不解码像素。</summary>
+        private static int SourcePixelWidth(string path)
+        {
+            try
+            {
+                using var fs = System.IO.File.OpenRead(path);
+                var frame = System.Windows.Media.Imaging.BitmapFrame.Create(
+                    fs,
+                    System.Windows.Media.Imaging.BitmapCreateOptions.DelayCreation,
+                    System.Windows.Media.Imaging.BitmapCacheOption.None);
+                return frame.PixelWidth;
+            }
+            catch { return 0; }
         }
 
         /// <summary>
