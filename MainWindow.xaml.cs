@@ -208,12 +208,25 @@ namespace TileBoard
         private Native.Screens.Info _screen;
 
         // —— 唤出时带出任务栏 ——
-        // 任务栏和板面同在置顶层，板面一 Show 再 Activate 就压到任务栏前面；
-        // 自动隐藏的任务栏更是不会弹（鼠标移到底边命中的是板面）。
-        // 唤出前把任务栏提到最前，处于自动隐藏时临时取消（收板面还原），
-        // 并从工作区里让出它占的那一条 —— 板面与任务栏谁都不遮谁。
+        // 2026-11-17 第二版，原则写死在这：**绝不动系统的任务栏设置，绝不搬任务栏窗口**。
+        //
+        // 上一版靠 SHAppBarMessage(ABM_SETSTATE) 临时关自动隐藏 + SetWindowPos 搬位置 +
+        // 200ms 常驻守护，实测每次唤出把 UI 线程堵 7~16 秒（shell 全量重排任务栏），
+        // 后果是板面卡在透明度 0（只看得见被提到最前的任务栏）、低级键盘钩子回调排队
+        // 导致 Win 键连发被吞、副屏任务栏被搬到错坐标 —— 用户原话「进程乱掉」。
+        //
+        // 现在只剩两件不碰设置的事：
+        //   ① 前台若是铺满整屏的应用，后台摘掉 shell 的「全屏」标记（ITaskbarList2），
+        //      任务栏自己滑回来；收板面时把标记还回去。
+        //   ② 板面几何在底部让出任务栏那一条（仅限任务栏常显时），不遮它。
         private readonly List<IntPtr> _trayWindows = new List<IntPtr>();
-        private bool _taskbarAutoHideSuspended;
+
+        /// <summary>唤出时前台那个铺满整屏的窗口（全屏应用）。非 0 表示要摘它的「全屏」标记。</summary>
+        private IntPtr _fullscreenFore;
+
+        /// <summary>摘/还全屏标记的代次号，用来作废在途的异步操作。</summary>
+        private int _fsMarkToken;
+
         private double _taskbarReserveDip;
 
         /// <summary>当前停靠屏的工作区（DIP）。_screen 还没就绪时退回主屏。</summary>
@@ -221,7 +234,7 @@ namespace TileBoard
         {
             Rect work = _screen?.Dip ?? SystemParameters.WorkArea;
 
-            // 自动隐藏的任务栏被临时叫出来时会占住底部一条，板面得让开
+            // 任务栏没占工作区（自动隐藏 / 被全屏应用挤走）时，板面得自己让出那一条
             if (_taskbarReserveDip > 0 && work.Height > _taskbarReserveDip + 200)
                 work.Height -= _taskbarReserveDip;
 
@@ -229,57 +242,133 @@ namespace TileBoard
         }
 
         /// <summary>
-        /// 把这块屏的任务栏带到前面来。必须在 ApplyWin10Geometry 之前调用 ——
-        /// 它决定了 WorkArea() 要不要给任务栏留一条位置。
+        /// 把这块屏的任务栏「带出来」——但只做不碰系统设置的两件事：
+        /// 摘全屏标记（后台）、算板面要不要在底部让位。
+        /// 必须在 ApplyWin10Geometry 之前调用（它决定 WorkArea() 要不要扣掉那一条）。
         /// </summary>
         private void BringOutTaskbar(IntPtr monitor)
         {
             _trayWindows.Clear();
             _taskbarReserveDip = 0;
 
-            double scale = 96.0 / (_screen?.Dpi ?? 96);
+            if (_screen == null) Native.Screens.TryNearCursor(out _screen);
+
             Rect work = _screen?.Dip ?? SystemParameters.WorkArea;
 
-            // 自动隐藏的任务栏在「没弹出」时是滑到屏幕外的，光置顶看不见，得先取消自动隐藏
-            bool autoHide = Native.Taskbar.IsAutoHide();
-            if (autoHide && Native.Taskbar.SetAutoHide(false))
-                _taskbarAutoHideSuspended = true;
+            // 工作区高度等于整屏 = 任务栏没在工作区里占位：要么用户设了自动隐藏，
+            // 要么全屏应用把任务栏挤走了。两种情况板面都得自己处理底部那一条。
+            bool workCoversFull = _screen != null
+                && Math.Abs(_screen.MonitorDip.Height - work.Height) < 2;
 
-            foreach (IntPtr tray in Native.Taskbar.ForMonitor(monitor))
+            // 自动隐藏的任务栏本来就该藏着 —— 不去叫它（用户明确要求不碰这个设置），
+            // 也就没必要替它留空位，否则板面底部白缩一条
+            bool autoHide = Native.Taskbar.IsAutoHide();
+
+            foreach (IntPtr tray in Native.Taskbar.ForMonitor(IntPtr.Zero))
             {
                 _trayWindows.Add(tray);
-                Native.Taskbar.BringToFront(tray);
 
-                // 常显任务栏：工作区本来就排除它了，不用再让位
-                if (!_taskbarAutoHideSuspended) continue;
                 if (!Native.Taskbar.TryGetRect(tray, out Rect r)) continue;
+                if (!Native.Screens.TryOfWindow(tray, out Native.Screens.Info trayMon)) continue;
 
-                // 只处理底部任务栏；顶部/侧边任务栏不占板面底部，工作区也已经让开
-                if (r.Top * scale < work.Bottom - 60) continue;
+                // 只认底部横向任务栏：高度合理、横向铺得够宽
+                double hDip = r.Height * 96.0 / Math.Max(1, trayMon.Dpi);
+                double wDip = r.Width * 96.0 / Math.Max(1, trayMon.Dpi);
+                if (hDip < 20 || hDip > 120) continue;
+                if (wDip < trayMon.Dip.Width * 0.5) continue;
 
-                double hDip = r.Height * scale;
-                if (hDip >= 20 && hDip <= 120 && hDip > _taskbarReserveDip)
-                    _taskbarReserveDip = hDip;
+                bool sameScreen = _screen != null && trayMon.Monitor == _screen.Monitor;
+
+                // 常显任务栏 + 这块屏的工作区没给它留位置（全屏应用正在挤它）
+                // → 板面从底部让出这一条，免得把滑回来的任务栏盖住
+                if (sameScreen && workCoversFull && !autoHide)
+                    _taskbarReserveDip = Math.Max(_taskbarReserveDip, hDip);
+
+                LogHookState2($"tray diag hwnd=0x{tray.ToInt64():X} " +
+                              $"vis={(Native.Taskbar.IsVisible(tray) ? 1 : 0)} " +
+                              $"rect={r.Left:0},{r.Top:0} {r.Width:0}x{r.Height:0} " +
+                              $"over={Native.Taskbar.CoveringWindowClass(tray)}");
             }
+
+            // 全屏应用在前台：后台摘标记（COM 走专用 STA 线程，UI 线程一步都不等）
+            if (_fullscreenFore != IntPtr.Zero) ReleaseFullscreenMark();
 
             LogHookState2($"taskbar mon=0x{monitor.ToInt64():X} n={_trayWindows.Count} " +
-                          $"autohide={autoHide} reserve={_taskbarReserveDip:0}");
+                          $"autoHide={autoHide} workFull={workCoversFull} " +
+                          $"reserve={_taskbarReserveDip:0} fore=0x{_fullscreenFore.ToInt64():X}");
         }
 
-        /// <summary>再提一次（Show + Activate 之后板面可能又跑到前面去了）。</summary>
-        private void RefrontTaskbar()
+        /// <summary>
+        /// 后台摘掉前台窗口的「全屏」标记。shell 收到这一下就会把任务栏滑回来 ——
+        /// 窗口位置、可见性、DWM 合成状态一概不变，更不改任何系统设置。
+        /// 延迟 120ms 是为了等板面 Show/Activate 落定：抢在它前面，shell 可能在
+        /// 下一次前台切换时又标回去。
+        /// </summary>
+        private void ReleaseFullscreenMark()
         {
-            foreach (IntPtr tray in _trayWindows) Native.Taskbar.BringToFront(tray);
+            IntPtr fore = _fullscreenFore;
+            int token = ++_fsMarkToken;
+
+            RunOnStaThread(() =>
+            {
+                System.Threading.Thread.Sleep(120);
+                if (System.Threading.Volatile.Read(ref _fsMarkToken) != token) return;
+
+                bool ok = Native.TaskbarList.ClearFullscreen(fore);
+                LogHookState2($"clear fullscreen fore=0x{fore.ToInt64():X} " +
+                              $"cls={WindowClassOf(fore)} ok={ok}");
+            });
         }
 
-        /// <summary>收板面时还原任务栏的自动隐藏设置——改的是系统设置，必须成对还回去。</summary>
+        /// <summary>
+        /// 收板面时把全屏标记还回去。不还的话，从全屏游戏里唤出一次磁贴板，
+        /// 任务栏就会一直压在游戏上，直到游戏自己退出全屏 —— 比不显示任务栏更难受。
+        /// </summary>
+        private void RestoreFullscreenMark()
+        {
+            IntPtr fore = _fullscreenFore;
+            _fullscreenFore = IntPtr.Zero;
+            if (fore == IntPtr.Zero) return;
+
+            int token = ++_fsMarkToken;   // 作废还在 sleep 的那一次「摘」
+
+            RunOnStaThread(() =>
+            {
+                System.Threading.Thread.Sleep(150);
+                if (System.Threading.Volatile.Read(ref _fsMarkToken) != token) return;
+                if (!IsWindow(fore)) return;
+
+                // 还之前再确认真的是全屏：期间窗口可能已经退出全屏 / 被最小化，
+                // 盲目标回 true 会让任务栏在桌面上莫名滑走
+                if (!IsFullscreenWindow(fore)) return;
+
+                bool ok = Native.TaskbarList.SetFullscreen(fore);
+                LogHookState2($"restore fullscreen fore=0x{fore.ToInt64():X} ok={ok}");
+            });
+        }
+
+        /// <summary>
+        /// 专用 STA 线程跑一段 COM。绝不用线程池：CTaskbarList 是 STA 对象，
+        /// 从 MTA 线程调用要靠代理 marshaling，失败概率和延迟都不划算。
+        /// </summary>
+        private static void RunOnStaThread(Action action)
+        {
+            var t = new System.Threading.Thread(() =>
+            {
+                try { action(); } catch { }
+            });
+            t.IsBackground = true;
+            t.SetApartmentState(System.Threading.ApartmentState.STA);
+            t.Start();
+        }
+
+        /// <summary>
+        /// 收板面时的收尾。任务栏设置我们从来没动过，所以这里没有「还原设置」的活儿 ——
+        /// 只剩把全屏标记还回去、清干净记账。
+        /// </summary>
         private void RestoreTaskbar()
         {
-            if (_taskbarAutoHideSuspended)
-            {
-                Native.Taskbar.SetAutoHide(true);
-                _taskbarAutoHideSuspended = false;
-            }
+            RestoreFullscreenMark();
             _trayWindows.Clear();
             _taskbarReserveDip = 0;
         }
@@ -348,6 +437,54 @@ namespace TileBoard
 
         [DllImport("user32.dll")]
         private static extern bool GetWindowRect(IntPtr hWnd, out WinRect rect);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
+
+        /// <summary>等 DWM 完成一次真正的合成。分层窗口的「提交」和「上屏」是两回事 ——
+        /// WPF 把位图交给 DWM 之后，屏上还要等下一次合成才看得到。</summary>
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmFlush();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int max);
+
+        /// <summary>
+        /// 这个窗口是不是「铺满整块屏」的全屏应用。判据用物理像素比 95% ——
+        /// 全屏游戏偶尔比屏矮一两个像素，用严格相等会漏判。
+        /// </summary>
+        private static bool IsFullscreenWindow(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            try
+            {
+                if (!GetWindowRect(hwnd, out WinRect r)) return false;
+                if (r.Right <= r.Left || r.Bottom <= r.Top) return false;
+
+                if (!Native.Screens.TryOfWindow(hwnd, out Native.Screens.Info mon)) return false;
+
+                Rect scr = mon.MonitorPhysical;
+                double w = (r.Right - r.Left) / Math.Max(1.0, scr.Width);
+                double h = (r.Bottom - r.Top) / Math.Max(1.0, scr.Height);
+                return w >= 0.95 && h >= 0.95;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>前台窗口类名，诊断用。</summary>
+        private static string WindowClassOf(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return "-";
+            try
+            {
+                var sb = new System.Text.StringBuilder(64);
+                return GetClassName(hwnd, sb, sb.Capacity) > 0 ? sb.ToString() : "?";
+            }
+            catch { return "?"; }
+        }
 
         public MainWindow()
         {
@@ -1466,6 +1603,16 @@ namespace TileBoard
             string fadeTestPath = GetArg("--fadetest");
             if (fadeTestPath != null) { RunFadeTest(fadeTestPath); return; }
 
+            // 调试/验收用：--showtrail <dir> 唤出瞬间连续抓屏，逐帧存 PNG ——
+            // 闪烁到底是「旧表面残留」「首帧不透明」还是「位置弹一下」，肉眼看帧最准
+            string showTrailDir = GetArg("--showtrail");
+            if (showTrailDir != null) { RunShowTrail(showTrailDir); return; }
+
+            // 调试/验收用：--slidetest <txt> 连跑两轮「滑入→滑出」，核对窗口位形
+            // 会不会在第二轮错位（滑出把窗口留在屏下，归位没做对就会滑到屏幕外）
+            string slideTestPath = GetArg("--slidetest");
+            if (slideTestPath != null) { RunSlideTest(slideTestPath); return; }
+
             // 调试/验收用：--showprobe <txt> 真实订阅唤出信号并逐 10ms 采样，
             // 与外部录屏对时间轴用 —— 排「唤出瞬间闪一下」
             string showProbePath = GetArg("--showprobe");
@@ -1586,6 +1733,10 @@ namespace TileBoard
             // 临时自检：--backdroptest <outBase> 自定义背景图 + 唤出时的任务栏处理
             string backdropTest = GetArg("--backdroptest");
             if (backdropTest != null) { await RunBackdropTest(backdropTest); return; }
+
+            // 临时自检：--fakefulltest <outBase> 用整屏窗口冒充全屏应用，验证唤出时任务栏被带回
+            string fakeFullTest = GetArg("--fakefulltest");
+            if (fakeFullTest != null) { await RunFakeFullScreenTest(fakeFullTest); return; }
 
             // 调试/验收用：--shot <路径> 让应用把自身界面渲染成 PNG 后退出
             string shotPath = GetShotPath();
@@ -3002,6 +3153,128 @@ namespace TileBoard
             Application.Current.Shutdown();
         }
 
+        /// <summary>
+        /// 唤出瞬间逐帧抓屏。属性的透明度曲线早就证明是对的（从 0 单调爬到 1），
+        /// 可肉眼还是闪 —— 那说明「屏上看到的」和「属性值」不是一回事。
+        /// 这里每 18ms 抓一张屏 + 同时记透明度，两相对照就能定死是哪一帧出问题：
+        /// 旧表面残留、首帧不透明、还是几何弹了一下。
+        /// </summary>
+        /// <summary>
+        /// 自检：连跑两轮唤出/收回，每 20ms 记一次窗口物理矩形。
+        /// 验的是三件事 —— 滑入起点确实在屏幕下沿之外、滑入过程是单调上移、
+        /// 收完之后归位了（第二轮起点不能继承「屏下」那个位置）。
+        /// </summary>
+        private async void RunSlideTest(string path)
+        {
+            var lines = new List<string>();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int clock() => (int)sw.ElapsedMilliseconds;
+
+            void Snap(string tag)
+            {
+                IntPtr h = new WindowInteropHelper(this).Handle;
+                string r = "-";
+                if (h != IntPtr.Zero && GetWindowRect(h, out WinRect rr))
+                    r = $"{rr.Left},{rr.Top} {rr.Right - rr.Left}x{rr.Bottom - rr.Top}";
+                lines.Add($"{clock(),5}ms {tag,-9} rect={r} wpf={Left:0},{Top:0} " +
+                          $"{Width:0}x{Height:0} vis={(IsVisible ? 1 : 0)} op={RootGrid.Opacity:0.00}");
+            }
+
+            try
+            {
+                Hide();
+                await Task.Delay(500);
+                Snap("hidden");
+
+                for (int round = 1; round <= 2; round++)
+                {
+                    ShowBoard();
+                    Snap($"show{round}");
+                    for (int i = 0; i < 22; i++) { await Task.Delay(20); Snap($"r{round}s{i}"); }
+
+                    HideBoard();
+                    Snap($"hide{round}");
+                    for (int i = 0; i < 16; i++) { await Task.Delay(20); Snap($"r{round}h{i}"); }
+
+                    await Task.Delay(260);
+                    Snap($"idle{round}");
+                }
+            }
+            catch (Exception ex)
+            {
+                lines.Add("EX " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            System.IO.File.WriteAllLines(path, lines);
+            Application.Current.Shutdown();
+        }
+
+        private async void RunShowTrail(string outDir)
+        {
+            var lines = new List<string>();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            int clock() => (int)sw.ElapsedMilliseconds;
+            void Log(string s) { lock (lines) lines.Add($"{clock(),5}ms  {s}"); }
+
+            try
+            {
+                System.IO.Directory.CreateDirectory(outDir);
+
+                Hide();
+                await Task.Delay(600);
+
+                int grabX = (int)Math.Max(0, Left);
+                int grabY = (int)Math.Max(0, Top);
+                int grabW = (int)Math.Min(760, Math.Max(200, Width));
+                int grabH = (int)Math.Min(620, Math.Max(200, Height));
+                Log($"hidden vis={IsVisible} op={RootGrid.Opacity:0.000} " +
+                    $"grab={grabX},{grabY} {grabW}x{grabH}");
+
+                var cts = new System.Threading.CancellationTokenSource();
+                int seq = 0;
+
+                var grabber = Task.Run(async () =>
+                {
+                    while (!cts.IsCancellationRequested)
+                    {
+                        int i = ++seq;
+                        var bmp = Native.ScreenCapture.Grab(grabX, grabY, grabW, grabH);
+                        if (bmp != null)
+                        {
+                            try
+                            {
+                                SaveBitmap(bmp, System.IO.Path.Combine(outDir, $"f{i:000}.png"));
+                            }
+                            catch { }
+                        }
+                        Log($"frame {i}");
+                        await Task.Delay(18);
+                    }
+                });
+
+                await Task.Delay(120);
+                ShowBoard();
+                Log($"ShowBoard ret op={RootGrid.Opacity:0.000}");
+
+                for (int i = 0; i < 70; i++)
+                {
+                    await Task.Delay(15);
+                    Log($"op={RootGrid.Opacity:0.000} shift={RootShift.Y:0.0} vis={IsVisible}");
+                }
+
+                cts.Cancel();
+                try { await grabber; } catch { }
+            }
+            catch (Exception ex)
+            {
+                lines.Add("EX " + ex.GetType().Name + ": " + ex.Message);
+            }
+
+            lock (lines)
+                System.IO.File.WriteAllLines(System.IO.Path.Combine(outDir, "trail.txt"), lines);
+            Application.Current.Shutdown();
+        }
+
         /// <summary>沿真实拖拽链路把 item 拖到 onto 的格位上（落点让左上角精确对齐）。</summary>
         private void DragOnto(TileItem item, TileGroup group, FrameworkElement onto)
         {
@@ -3861,7 +4134,7 @@ namespace TileBoard
             lines.Add($"image={(src == null ? "null" : src.PixelWidth + "x" + src.PixelHeight)} " +
                       $"vis={BackdropImage.Visibility}");
             lines.Add($"tintAlpha={((SolidColorBrush)BackdropTint.Background).Color.A}");
-            lines.Add($"tray n={_trayWindows.Count} suspended={_taskbarAutoHideSuspended} " +
+            lines.Add($"tray n={_trayWindows.Count} autoHide={Native.Taskbar.IsAutoHide()} " +
                       $"reserve={_taskbarReserveDip:0}");
             lines.Add($"tray hwnd={string.Join(",", _trayWindows.Select(h => h.ToInt64().ToString("X")))}");
             lines.Add($"geom={Left:0},{Top:0} {Width:0}x{Height:0} work={WorkArea()}");
@@ -3882,8 +4155,74 @@ namespace TileBoard
             Application.Current.Shutdown();
         }
 
+        /// <summary>
+        /// 自检：造一个覆盖整屏的窗口冒充全屏应用（外壳会因此把任务栏挤走），
+        /// 再唤出板面，看任务栏有没有被搬回屏幕内、板面有没有给它让位。
+        /// 抓屏只看底部那一条 —— 分层窗口不会被 BitBlt 拍进去，所以看到的是
+        /// 「假全屏应用 / 任务栏」的真实叠放结果。
+        /// </summary>
+        private async Task RunFakeFullScreenTest(string outBase)
+        {
+            var lines = new List<string>();
+            await Task.Delay(600);
+
+            double sw = SystemParameters.PrimaryScreenWidth;
+            double sh = SystemParameters.PrimaryScreenHeight;
+
+            var fake = new Window
+            {
+                WindowStyle = WindowStyle.None,
+                ResizeMode = ResizeMode.NoResize,
+                Background = new SolidColorBrush(Color.FromRgb(0x24, 0x6A, 0xC8)),
+                ShowInTaskbar = false,
+                WindowStartupLocation = WindowStartupLocation.Manual,
+                Left = 0,
+                Top = 0,
+                Width = sw,
+                Height = sh,
+                Topmost = true
+            };
+
+            fake.Show();
+            fake.Activate();
+            await Task.Delay(1500);
+
+            IntPtr tray = IntPtr.Zero;
+            foreach (IntPtr h in Native.Taskbar.ForMonitor(IntPtr.Zero)) { tray = h; break; }
+
+            Native.Taskbar.TryGetRect(tray, out Rect before);
+            lines.Add($"fake fullscreen: screen={sw:0}x{sh:0} " +
+                      $"tray={before.Top:0}..{before.Bottom:0} h={before.Height:0} " +
+                      $"visible={Native.Taskbar.IsVisible(tray)}");
+
+            // 抓底部 80px：这时任务栏要么被挤到屏外、要么被假全屏窗口压住
+            SaveBitmap(Native.ScreenCapture.Grab(0, (int)Math.Max(0, sh - 80), (int)sw, 80),
+                       outBase + "-fullscreen.png");
+
+            // 走真实的唤出路径
+            Hide();
+            ShowBoard();
+            await Task.Delay(1200);
+
+            Native.Taskbar.TryGetRect(tray, out Rect after);
+            lines.Add($"after summon: tray={after.Top:0}..{after.Bottom:0} " +
+                      $"visible={Native.Taskbar.IsVisible(tray)} " +
+                      $"moved={(Math.Abs(before.Top - after.Top) > 2 ? "是" : "否")}");
+            lines.Add($"reserve={_taskbarReserveDip:0} panelTop={Top:0} panelH={Height:0} " +
+                      $"workBottom={WorkArea().Bottom:0} screenBottom={sh:0}");
+
+            SaveBitmap(Native.ScreenCapture.Grab(0, (int)Math.Max(0, sh - 80), (int)sw, 80),
+                       outBase + "-after.png");
+
+            fake.Close();
+
+            try { System.IO.File.WriteAllText(outBase + ".txt", string.Join("\n", lines)); } catch { }
+            Application.Current.Shutdown();
+        }
+
         private async Task CaptureAndExit(string path)
-        {            await Task.Delay(2500);   // 等图标与布局稳定
+        {
+            await Task.Delay(2500);   // 等图标与布局稳定
             RevealForCapture();
             SaveRootPng(path);
             Application.Current.Shutdown();
@@ -4097,9 +4436,15 @@ namespace TileBoard
 
         /// <summary>
         /// 唤出面板。
-        /// 三个坑都在这里：不能反复切换 Topmost（每次切换都让 DWM 重排一次 Z 序，会闪），
-        /// 透明度必须在 Show 之前就是 0（否则先以不透明画一帧再开始动画），
-        /// 动画要等窗口真正进入渲染队列后再起（立刻起会和首帧合成抢跑）。
+        ///
+        /// 现在走的是「整窗从屏幕下沿滑上来」：
+        ///   ① 几何在不可见时就定好，Show 前把窗口物理挪到屏幕下沿之外；
+        ///   ② Show 之后等在屏外把首帧合成烧掉（分层窗口 14MB 位图，实测 ~200ms）；
+        ///   ③ 再用 DispatcherTimer + SetWindowPos 逐帧把窗口顶上来到位。
+        /// 内容层透明度全程是 1 —— 淡入淡出已退役：它在分层窗口上必然要先「重传位图」，
+        /// 首帧合成还把 UI 线程憋住 200ms，合成落地时取的是已经爬到中途的透明度，
+        /// 肉眼就是「先完整闪一下、再淡入」（2026-11-17 抓帧实证）。
+        /// 位移没有这个问题：DWM 移动已有表面只是换贴图位置，任何一帧都是完整画面。
         /// </summary>
         private void ShowBoard()
         {
@@ -4107,9 +4452,46 @@ namespace TileBoard
 
             if (IsVisible && !_hiding) return;
 
+            // 诊断：记录唤出全过程每一次窗口位形变化。只在自检里采集，
+            // 正常唤出不付这份代价（每次 8 次 GetWindowRect + 字符串拼接）
+            bool diagOn = IsSelfTestRun();
+            var diag = new System.Text.StringBuilder();
+            var swDiag = System.Diagnostics.Stopwatch.StartNew();
+            void D(string tag)
+            {
+                if (!diagOn) return;
+                IntPtr dh = new WindowInteropHelper(this).Handle;
+                string dr = "-";
+                if (dh != IntPtr.Zero && GetWindowRect(dh, out WinRect drr))
+                    dr = $"{drr.Left},{drr.Top} {drr.Right - drr.Left}x{drr.Bottom - drr.Top}";
+                diag.AppendLine($"DIAG {swDiag.ElapsedMilliseconds,4}ms {tag,-9} " +
+                                $"rect={dr} wpf={Left:0},{Top:0} {Width:0}x{Height:0} " +
+                                $"op={RootGrid.Opacity:0.00} vis={(IsVisible ? 1 : 0)}");
+            }
+            D("enter");
+
+            // 上一次收起还在滑动（连着按 Win）：先停下滑出并归位。
+            // 不这么做的话，这次唤出会把「滑到半路的位置」当成终点，
+            // 板面会一路滑到屏幕外面去。
+            if (_slideTimer != null)
+            {
+                _slideTimer.Stop();
+                _slideTimer = null;
+                ++_slideSeq;
+            }
+            if (_hiding) ApplyWin10Geometry();
+
             _hiding = false;
             ++_fadeToken;
             HideAppsPanel(false);
+
+            // 唤出前的前台窗口：如果它铺满整块屏，那就是「全屏应用」。
+            // shell 把这种窗口标记成全屏之后，任务栏的 XAML 内容会整体滑走
+            // （窗口还在原位、IsWindowVisible 仍是 true，但变成透明 —— 透过它
+            //  看到的是游戏画面）。必须把手头这个前台窗口从全屏名单里摘掉，
+            // shell 才会把任务栏滑回来。
+            IntPtr fore = GetForegroundWindow();
+            _fullscreenFore = IsFullscreenWindow(fore) ? fore : IntPtr.Zero;
 
             // Win10 唤出开始菜单永远回到主界面，不会停在上次翻到的某一页
             HideSettingsPage(false);
@@ -4139,6 +4521,7 @@ namespace TileBoard
                                      0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
                     ApplyWin10Geometry();
+                    D("premove");
                     LogHookState2($"summon mon={picked.Monitor.ToInt64():X} dpi={picked.Dpi} " +
                                   $"dip={picked.Dip.Width:0}x{picked.Dip.Height:0} " +
                                   $"geom L={Left:0} T={Top:0} W={Width:0} H={Height:0}");
@@ -4155,11 +4538,14 @@ namespace TileBoard
                                       MinPanelWidth, Math.Max(MinPanelWidth, work.Width));
             if (Math.Abs(Width - wantW) > 0.5) ApplyWin10Geometry();
 
-            // 首帧必须是全透明的
+            // 内容层永远不透明：唤出动效改由窗口整体位移承担，不再碰 RootGrid.Opacity。
+            // 淡入淡出对分层窗口是灾难 —— 每改一次透明度都要重传一张 14MB 位图，
+            // 而首帧合成又要憋住 UI 线程 200ms 以上，合成落地时取的是「已经爬到」
+            // 的透明度，肉眼就是「先完整闪一下、再淡入」（2026-11-17 抓帧实证）。
             RootGrid.BeginAnimation(OpacityProperty, null);
             RootShift.BeginAnimation(TranslateTransform.YProperty, null);
-            RootGrid.Opacity = 0;
-            RootShift.Y = 10;
+            RootGrid.Opacity = 1;
+            RootShift.Y = 0;
 
             ApplyAppearance(new WindowInteropHelper(this).Handle);
 
@@ -4169,109 +4555,194 @@ namespace TileBoard
             // 都 Topmost=false，ShowBoard 又 true，每次唤出都白折腾一遍 Z 序）。
             // 现在永久保持置顶：窗口隐藏时根本不上屏，置顶与否毫无副作用。
             Topmost = true;
+
+            // ===== 起点放在屏幕下沿之外（用户要求：不要淡入淡出，改成滑上来）=====
+            // 窗口一出现就是完整画面，只是整块停在屏幕下方 —— 首帧合成（满屏分层窗口
+            // 14MB 位图，实测 ~200ms）全部发生在看不见的地方。合成落盘后再逐帧把
+            // 窗口顶上来：DWM 移动一个已有表面的分层窗口是纯贴图，不重建表面、
+            // 不重传位图，也就不存在「凭空半透明蹦出来」那一幕。
+            IntPtr hwndShow = new WindowInteropHelper(this).Handle;
+            WinRect preRect = new WinRect();
+            bool slideOk = hwndShow != IntPtr.Zero && GetWindowRect(hwndShow, out preRect);
+            if (slideOk)
+                slideOk = preRect.Right > preRect.Left && preRect.Bottom > preRect.Top;
+
+            int slideLeft = 0, slideEndTop = 0, slideH = 0;
+            if (slideOk)
+            {
+                slideLeft = preRect.Left;
+                slideEndTop = preRect.Top;
+                slideH = preRect.Bottom - preRect.Top;
+                // 整窗落在屏幕下沿之外：滑入的第一帧只露最下面那条边
+                SetWindowPos(hwndShow, IntPtr.Zero, slideLeft, slideEndTop + slideH, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            D("parked");
+
             Show();
+
+            // 等首帧合成真正落盘，再逼 DWM 合成一次。窗口此刻在屏幕下面，
+            // 这段等待用户看不见 —— 等的是「表面就绪」，不是「画面出现」。
+            UpdateLayout();
+            Dispatcher.Invoke(System.Windows.Threading.DispatcherPriority.Render, new Action(() => { }));
+            try { DwmFlush(); } catch { }
+            D("synced");
+
             Activate();
-            SetForegroundWindow(new WindowInteropHelper(this).Handle);
+            SetForegroundWindow(hwndShow);
             _shownAt = DateTime.UtcNow;
 
-            // Show + Activate 会让板面重新排到置顶层最前，任务栏再提一次 ——
-            // 用户要的是「唤出磁贴板时任务栏一起出来」，不是被板面压回去
-            RefrontTaskbar();
+            // 任务栏那一边不在这里做任何事：全屏标记已经在 BringOutTaskbar 里
+            // 交给后台 STA 线程去摘了，板面几何也已经为常显任务栏让出底部一条。
+            // 这里绝不能再插 Z 序 / 提任务栏 —— 那一步会让板面丢掉前台，
+            // 同时把 shell 拖进反复重排，上一版卡死十几秒就是这么来的。
 
-            // 诊断闪烁：Show 落定后的真实物理矩形。它若和 summon 日志里的目标几何不一致，
-            // 就是 WPF 在可见之后还在动窗口 —— 闪一下就发生在这一步
-            IntPtr hwndShown = new WindowInteropHelper(this).Handle;
-            if (GetWindowRect(hwndShown, out WinRect wr))
+            if (slideOk)
+            {
+                // 从屏幕下沿滑到该在的位置。窗口本身不透明地整体移动，
+                // 任何一帧都是完整画面，不存在「渐变到一半」这种中间态。
+                SlideTo(slideLeft, slideEndTop + slideH, slideEndTop, SlideInMs, () =>
+                {
+                    // 滑到位后把 WPF 的 Left/Top 属性拉回权威值。滑入是直接改 HWND
+                    // 物理位置，WPF 那边还停在「屏幕下沿外」的旧值；不校正的话，
+                    // 下一次布局/DPI 变更会把窗口拽回屏下，看起来像面板自己消失了。
+                    ApplyWin10Geometry();
+
+                    if (GetWindowRect(new WindowInteropHelper(this).Handle, out WinRect wr))
+                        LogHookState2($"slid phys={wr.Left},{wr.Top} " +
+                                      $"{wr.Right - wr.Left}x{wr.Bottom - wr.Top}");
+                });
+            }
+            else if (GetWindowRect(hwndShow, out WinRect wr))
+            {
+                // 拿不到矩形就退化成直接显示，绝不能把窗口留在屏幕下面
                 LogHookState2($"shown phys={wr.Left},{wr.Top} {wr.Right - wr.Left}x{wr.Bottom - wr.Top}");
+            }
 
-            // 淡入不交给 BeginAnimation：满屏分层窗口的首帧合成会把 UI 线程憋住 ~100ms，
-            // 动画时钟和 Render 优先级的回调都在这条被憋住的队伍里，实测要么拖到首帧
-            // 之后才起（屏上瞬移出现），要么中途停摆再重启（闪一下）。改成逐帧手动驱动 ——
-            // Rendering 每帧渲染前触发一格，第 0 格仍是 0（首帧不抢跑），之后逐格爬升；
-            // 就算中途被别的活儿堵住，也只是画面暂停，绝不会回跳或瞬移。
-            StartFadeIn();
+            if (IsSelfTestRun())
+            {
+                string dump = diag.ToString();
+                Dispatcher.BeginInvoke(new Action(() => LogHookState2("=== ShowBoard diag ===\n" + dump)),
+                    System.Windows.Threading.DispatcherPriority.Background);
+            }
         }
 
-        /// <summary>手动淡入用的代次号：每次唤出/收起都递增，作废在途的逐格回调。</summary>
-        private int _fadeSeq;
+        /// <summary>滑动代次号：每次唤出/收起都递增，作废在途的滑动定时器。</summary>
+        private int _slideSeq;
 
-        /// <summary>淡入一共走多少格（帧）。60Hz 下 12 格 ≈ 200ms，和 Win10 开始菜单一个节奏。</summary>
-        private const int FadeInFrames = 12;
+        private System.Windows.Threading.DispatcherTimer _slideTimer;
+
+        /// <summary>滑入时长（毫秒）。DWM 移动已有表面比重新合成便宜得多，可以走得干脆些。</summary>
+        private const int SlideInMs = 260;
+
+        /// <summary>滑出时长（毫秒）。收得比放快一点，手感才是「弹回去」而不是「慢慢沉下去」。</summary>
+        private const int SlideOutMs = 190;
 
         private static double EaseOutCubic(double x) => 1 - Math.Pow(1 - x, 3);
 
         /// <summary>
-        /// 逐帧淡入。挂在 CompositionTarget.Rendering 上，每帧把透明度推进一步；
-        /// 不用动画时钟，所以不受 dispatcher 阻塞影响 —— 卡了就停格，绝不会跳变。
+        /// 把窗口从 fromTop 移到 toTop（物理像素），按真实时间 + EaseOutCubic 推进。
+        ///
+        /// 为什么移动窗口而不是动 XAML 的 RootShift：
+        ///   ① 分层窗口里整层内容的 RenderTransform 每帧都要重绘整窗（14MB），
+        ///      实测只有 10fps，滑起来像幻灯片；
+        ///   ② SetWindowPos 移动窗口不重建表面、不重传位图，DWM 只换贴图位置，
+        ///      帧率跟得上，而且任何一帧都是完整画面 —— 天然不会「闪」。
+        /// 定时器用 12ms 而不是 CompositionTarget.Rendering：后者被首帧合成憋住时
+        /// 会直接停摆，窗口会僵在半路。
         /// </summary>
-        private void StartFadeIn()
+        private void SlideTo(int leftPhys, int fromTop, int toTop, int ms, Action onDone)
         {
-            if (!IsVisible) return;
+            IntPtr hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd == IntPtr.Zero) { onDone?.Invoke(); return; }
 
-            _fadeSeq++;
-            int seq = _fadeSeq;
-            int frame = 0;
+            _slideTimer?.Stop();
+            _slideTimer = null;
 
-            EventHandler step = null;
-            step = (s, e) =>
+            int seq = ++_slideSeq;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+
+            var timer = new System.Windows.Threading.DispatcherTimer(
+                System.Windows.Threading.DispatcherPriority.Render)
             {
-                // 期间被收起或重新唤出过：撤掉回调，别和新的一套打架
-                if (seq != _fadeSeq || !IsVisible)
-                {
-                    CompositionTarget.Rendering -= step;
-                    if (!IsVisible) { RootGrid.Opacity = 0; RootShift.Y = 10; }
-                    return;
-                }
-
-                double k = EaseOutCubic(Math.Min(1.0, frame / (double)(FadeInFrames - 1)));
-                RootGrid.Opacity = k;
-                RootShift.Y = 10 * (1 - k);
-
-                frame++;
-                if (frame >= FadeInFrames)
-                    CompositionTarget.Rendering -= step;
+                Interval = TimeSpan.FromMilliseconds(12)
             };
-            CompositionTarget.Rendering += step;
+
+            void Finish()
+            {
+                timer.Stop();
+                if (_slideTimer == timer) _slideTimer = null;
+                if (seq != _slideSeq) return;
+                SetWindowPos(hwnd, IntPtr.Zero, leftPhys, toTop, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                onDone?.Invoke();
+            }
+
+            timer.Tick += (s, e) =>
+            {
+                if (seq != _slideSeq) { timer.Stop(); if (_slideTimer == timer) _slideTimer = null; return; }
+
+                double t = Math.Min(1.0, sw.Elapsed.TotalMilliseconds / ms);
+                if (t >= 1.0) { Finish(); return; }
+
+                double k = EaseOutCubic(t);
+                int y = (int)Math.Round(fromTop + (toTop - fromTop) * k);
+                SetWindowPos(hwnd, IntPtr.Zero, leftPhys, y, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            };
+
+            _slideTimer = timer;
+            SetWindowPos(hwnd, IntPtr.Zero, leftPhys, fromTop, 0, 0,
+                         SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            timer.Start();
         }
 
-        /// <summary>淡出后再隐藏。Win10 的开始菜单收回时也是先淡掉，不是啪一下消失。</summary>
+        /// <summary>
+        /// 滑出屏幕下沿后再隐藏。收得比放快一点，手感是「弹回去」而不是「慢慢沉下去」。
+        ///
+        /// 不再走淡出：分层窗口淡出到 0 再 Hide()，DWM 手里留着的是淡出前那张完整
+        /// 画面 —— 下次 Show 的头一两帧就是它，肉眼正是「板面先完整闪一下、再淡入」。
+        /// 整体滑出去的话，DWM 最后拿到的那张表面本身是完整的，滑走的每一帧也都完整，
+        /// 没有任何「半透明中间态」需要被下一轮继承。
+        /// </summary>
         private void HideBoard()
         {
             if (!IsVisible || _hiding) return;
 
-            // 面板要淡出时，文件夹那层浮盖先收掉：它是最后加进 RootGrid 的，
-            // 留着就会跟着一起淡出，下次唤出还挂在那儿
+            // 文件夹那层浮盖先收掉：它挂在 RootGrid 上，会跟着窗口一起滑走，
+            // 下次唤出还挂在那儿
             CloseFolder();
 
             _hiding = true;
-            _fadeSeq++;             // 作废在途的逐格淡入，别和淡出动画打架
             int token = ++_fadeToken;
 
-            var ease = new CubicEase { EasingMode = EasingMode.EaseIn };
-            var fade = new System.Windows.Media.Animation.DoubleAnimation(
-                RootGrid.Opacity, 0, FadeOut) { EasingFunction = ease };
+            IntPtr hwnd = new WindowInteropHelper(this).Handle;
+            if (hwnd == IntPtr.Zero || !GetWindowRect(hwnd, out WinRect r))
+            {
+                _hiding = false;
+                Hide();
+                RestoreTaskbar();
+                return;
+            }
 
-            fade.Completed += (s, e) =>
+            int h = r.Bottom - r.Top;
+
+            SlideTo(r.Left, r.Top, r.Top + h, SlideOutMs, () =>
             {
                 // 期间又被唤出或重新收起过，这一次的收尾就作废
                 if (token != _fadeToken) return;
 
-                RootGrid.BeginAnimation(OpacityProperty, null);
-                RootShift.BeginAnimation(TranslateTransform.YProperty, null);
-                RootGrid.Opacity = 0;
-                RootShift.Y = 10;
-                // Topmost 保持 true 永不撤销 —— 唤出时若从非置顶切回置顶，
-                // DWM 重排 Z 序就是唤起闪烁的元凶（见 ShowBoard 内注释）。
-                // 窗口隐藏后不上屏，置顶属性没有任何副作用。
                 _hiding = false;
                 Hide();
 
-                // 板面真的收完了才还原任务栏的自动隐藏设置：中途又被唤出的话，
-                // token 对不上会提前 return，任务栏应该保持被叫出来的状态
-                RestoreTaskbar();
-            };
+                // 收完必须归位：滑动把窗口留在了屏幕下沿之外，若就这么放着，
+                // 下次唤出读到的「当前位置」就是屏下，起点/终点会一起错位，
+                // 面板会滑到屏幕外面去。隐藏状态下归位没有任何视觉代价。
+                ApplyWin10Geometry();
 
-            RootGrid.BeginAnimation(OpacityProperty, fade);
+                // 板面真的收完了才收任务栏那边的尾巴
+                RestoreTaskbar();
+            });
         }
 
         private void OnDeactivated(object sender, EventArgs e)

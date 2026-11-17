@@ -21,6 +21,12 @@ namespace TileBoard.Native
             public Rect Dip;       // WPF 坐标（DIP），按这块屏自己的 DPI 换算
             public Rect Physical;  // 物理像素，GDI 抓屏直接用
             public uint Dpi;
+
+            // 整屏矩形（含任务栏占的那条）。用它判断「工作区是不是等于整屏」——
+            // 全屏应用里任务栏被挤走时，工作区会涨到整屏高度，板面照那个尺寸做
+            // 就会把整块屏铺满，系统于是继续把任务栏按在全屏模式里不还给你。
+            public Rect MonitorDip;
+            public Rect MonitorPhysical;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -107,6 +113,7 @@ namespace TileBoard.Native
             catch { }   // shcore 缺失等极端情况：按 96 兜底
 
             RECT w = mi.rcWork;
+            RECT m = mi.rcMonitor;
 
             info = new Info
             {
@@ -117,7 +124,13 @@ namespace TileBoard.Native
                     w.Left * 96.0 / dpi,
                     w.Top * 96.0 / dpi,
                     (w.Right - w.Left) * 96.0 / dpi,
-                    (w.Bottom - w.Top) * 96.0 / dpi)
+                    (w.Bottom - w.Top) * 96.0 / dpi),
+                MonitorPhysical = new Rect(m.Left, m.Top, m.Right - m.Left, m.Bottom - m.Top),
+                MonitorDip = new Rect(
+                    m.Left * 96.0 / dpi,
+                    m.Top * 96.0 / dpi,
+                    (m.Right - m.Left) * 96.0 / dpi,
+                    (m.Bottom - m.Top) * 96.0 / dpi)
             };
             return true;
         }

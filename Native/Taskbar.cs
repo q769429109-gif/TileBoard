@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows;
@@ -6,29 +6,24 @@ using System.Windows;
 namespace TileBoard.Native
 {
     /// <summary>
-    /// 任务栏（Shell_TrayWnd / Shell_SecondaryTrayWnd）的定位、置顶与自动隐藏控制。
+    /// 任务栏（Shell_TrayWnd / Shell_SecondaryTrayWnd）的**只读**查询层。
     ///
-    /// 为什么需要这一层：板面是 Topmost 分层窗口，唤出瞬间它会拿到焦点。
-    /// 任务栏虽然也是置顶层，但同一层里后激活的在前 —— 于是板面一出来，
-    /// 任务栏就被压到后面去（自动隐藏的任务栏更是干脆不弹，因为鼠标移到底边
-    /// 命中的是板面而不是任务栏的触发区）。要让「唤出磁贴板时任务栏一起出来」，
-    /// 只能用 Win32 把任务栏重新提到置顶层最前，并在它处于自动隐藏状态时
-    /// 临时取消自动隐藏，收板面时再还原。
+    /// 2026-11-17 大改：这个类曾经带一整套「写」操作 —— 临时关自动隐藏（ABM_SETSTATE）、
+    /// 把任务栏 SetWindowPos 搬回屏内、插 Z 序、逼 shell 重画。代价是每次唤出都把
+    /// UI 线程堵 7~16 秒（shell 全量重排任务栏），连带把低级键盘钩子拖到超时、
+    /// Win 键连发被吞、副屏任务栏被搬到错误坐标、进程行为整个乱掉。
+    ///
+    /// 用户明确要求：不许改电脑的自动隐藏任务栏设置。所以「写」操作全部删干净 ——
+    /// 这个类现在只回答「任务栏在哪、多高、是不是自动隐藏、是不是被 cloak」，
+    /// 让板面自己调整几何，绝不去动 shell 的状态。
+    /// 真正让任务栏在全屏应用里滑回来的手段只有一个，且它不改任何设置：
+    /// ITaskbarList2::MarkFullscreenWindow(hwnd, FALSE) —— 见 TaskbarList.cs。
     /// </summary>
     internal static class Taskbar
     {
         private const int ABM_GETSTATE = 0x00000004;
-        private const int ABM_SETSTATE = 0x0000000A;
 
         private const int ABS_AUTOHIDE = 0x1;
-        private const int ABS_ALWAYSONTOP = 0x2;
-
-        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-
-        private const uint SWP_NOSIZE = 0x0001;
-        private const uint SWP_NOMOVE = 0x0002;
-        private const uint SWP_NOACTIVATE = 0x0010;
-        private const uint SWP_SHOWWINDOW = 0x0040;
 
         private const int MONITOR_DEFAULTTONEAREST = 2;
 
@@ -47,12 +42,6 @@ namespace TileBoard.Native
         private struct RECT
         {
             public int Left, Top, Right, Bottom;
-        }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct POINT
-        {
-            public int X, Y;
         }
 
         [DllImport("shell32.dll", CallingConvention = CallingConvention.StdCall)]
@@ -76,9 +65,16 @@ namespace TileBoard.Native
         [DllImport("user32.dll")]
         private static extern bool IsWindowVisible(IntPtr hwnd);
 
+        private const int DWMWA_CLOAKED = 14;
+        private const uint GW_HWNDPREV = 3;
+        private const uint GW_OWNER = 4;
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr,
+                                                        out int value, int size);
+
         [DllImport("user32.dll")]
-        private static extern bool SetWindowPos(IntPtr hWnd, IntPtr insertAfter,
-                                                int x, int y, int cx, int cy, uint flags);
+        private static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
 
         private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
 
@@ -87,7 +83,10 @@ namespace TileBoard.Native
             cbSize = Marshal.SizeOf<APPBARDATA>()
         };
 
-        /// <summary>任务栏当前是不是「自动隐藏」。用户没开就是 false，后面全都不用管。</summary>
+        /// <summary>
+        /// 任务栏当前是不是「自动隐藏」。只读查询 —— 调用方据此决定板面要不要
+        /// 在底部留一条空位，绝不允许反过来去改它。
+        /// </summary>
         internal static bool IsAutoHide()
         {
             try
@@ -95,25 +94,6 @@ namespace TileBoard.Native
                 var data = NewBarData();
                 UIntPtr state = SHAppBarMessage(ABM_GETSTATE, ref data);
                 return ((int)state.ToUInt64() & ABS_AUTOHIDE) != 0;
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// 临时改自动隐藏。enable=false → 任务栏常显（会立刻滑出来）；true → 恢复自动隐藏。
-        /// 这是改系统设置，调用方必须成对使用，收板面/退出程序时还原。
-        /// </summary>
-        internal static bool SetAutoHide(bool enable)
-        {
-            try
-            {
-                var data = NewBarData();
-                data.lParam = (IntPtr)(enable ? (ABS_AUTOHIDE | ABS_ALWAYSONTOP) : ABS_ALWAYSONTOP);
-                SHAppBarMessage(ABM_SETSTATE, ref data);
-                return true;
             }
             catch
             {
@@ -164,6 +144,13 @@ namespace TileBoard.Native
             return matched;
         }
 
+        /// <summary>这个任务栏属于哪块屏。</summary>
+        internal static IntPtr MonitorOf(IntPtr hwnd)
+        {
+            try { return hwnd == IntPtr.Zero ? IntPtr.Zero : MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST); }
+            catch { return IntPtr.Zero; }
+        }
+
         /// <summary>任务栏窗口的物理像素矩形。</summary>
         internal static bool TryGetRect(IntPtr hwnd, out Rect rect)
         {
@@ -187,16 +174,26 @@ namespace TileBoard.Native
             catch { return false; }
         }
 
-        /// <summary>把任务栏重新提到置顶层最前，但不抢焦点（板面还得是当前活动窗口）。</summary>
-        internal static void BringToFront(IntPtr hwnd)
+        /// <summary>Z 序前驱（盖在它上面的那一个窗口）的类名，诊断用。</summary>
+        internal static string CoveringWindowClass(IntPtr hwnd)
         {
-            if (hwnd == IntPtr.Zero) return;
+            if (hwnd == IntPtr.Zero) return "-";
             try
             {
-                SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                IntPtr prev = GetWindow(hwnd, GW_HWNDPREV);
+                if (prev == IntPtr.Zero) return "(顶层)";
+
+                var sb = new System.Text.StringBuilder(64);
+                GetClassName(prev, sb, sb.Capacity);
+
+                IntPtr owner = GetWindow(prev, GW_OWNER);
+                var ob = new System.Text.StringBuilder(64);
+                if (owner != IntPtr.Zero) GetClassName(owner, ob, ob.Capacity);
+
+                return sb.ToString() + (ob.Length > 0 ? " owner=" + ob : "") +
+                       " vis=" + (IsWindowVisible(prev) ? "1" : "0");
             }
-            catch { }
+            catch { return "?"; }
         }
     }
 }
