@@ -28,14 +28,10 @@
             <ColumnDefinition Width="6"/>
         </Grid.ColumnDefinitions>
 
-        <!-- ============ 毛玻璃垫底 ============
-             唤出的那一刻把背后的桌面截下来（此时本窗口已 Hide，抓不到自己），
-             按「毛玻璃强度」缩小/模糊后铺满整窗垫在最底层。
-             板面自己带 alpha，透过来的就是这一层 —— 强度才能连续变化。
-             DWM 亚克力的模糊半径是系统写死的，用它永远只有开/关两档。 -->
-        <Image x:Name="GlassImage" Grid.ColumnSpan="3"
-               Stretch="Fill" Visibility="Collapsed" IsHitTestVisible="False"
-               RenderOptions.BitmapScalingMode="HighQuality"/>
+        <!-- ============ 毛玻璃 ============
+             模糊交给 DWM 亚克力（SetWindowCompositionAttribute），
+             染色由 BoardSurface 的半透明底色承担，两层各司其职。
+             自绘截图模糊链已退役（2026-11-17）。 -->
 
         <!-- ============ 左侧图标栏（Win10 结构：上=所有应用，下=文档/工具/设置/电源） ============ -->
         <Border Grid.Column="0" Background="{StaticResource RailBack}">
@@ -168,23 +164,12 @@
                         <TextBlock Text="越低，底下的桌面透得越多。" FontSize="11"
                                    Foreground="#858585" Margin="0,4,0,0"/>
 
-                        <Grid Margin="0,22,0,0">
-                            <TextBlock Text="毛玻璃强度" FontSize="12.5" Foreground="#DCDCDC"/>
-                            <TextBlock x:Name="BlurValue" Text="70%" HorizontalAlignment="Right"
-                                       FontSize="12.5" Foreground="#9A9A9A"/>
-                        </Grid>
-                        <Slider x:Name="BlurSlider" Minimum="0" Maximum="100" Value="70"
-                                Style="{StaticResource SettingSlider}"
-                                Margin="0,4,0,0" ValueChanged="BlurSlider_ValueChanged"/>
-                        <TextBlock Text="0 是背后完全清晰，越高越糊（唤出瞬间截取背后画面来计算）。" FontSize="11"
-                                   Foreground="#858585" Margin="0,4,0,0"/>
-
                         <CheckBox x:Name="AcrylicCheck" Content="启用毛玻璃"
                                   Style="{StaticResource SettingCheck}"
                                   FontSize="12.5" Margin="0,16,0,0"
                                   Checked="AcrylicCheck_Changed"
                                   Unchecked="AcrylicCheck_Changed"/>
-                        <TextBlock Text="关掉之后只剩纯半透明，不截屏也不模糊，最省性能。"
+                        <TextBlock Text="开 = 系统 DWM 模糊（Win10 透明效果同款）；关 = 纯半透明。"
                                    FontSize="11" Foreground="#858585" Margin="0,4,0,0"/>
 
                         <Border Height="1" Background="#1FFFFFFF" Margin="0,24,0,22"/>

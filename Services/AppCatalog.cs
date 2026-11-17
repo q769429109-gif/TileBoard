@@ -76,55 +76,100 @@ namespace TileBoard.Services
                 if (_iconCache.TryGetValue(key, out var cached)) return cached;
             }
 
-            BitmapSource result = null;
-            IntPtr hbmp = IntPtr.Zero;
-            try
-            {
-                hbmp = NativeShell.GetAppImageHandle(aumid, pixels);
-
-                // shell 对一批桌面桥应用（Office C2R / 老 Edge / Skype）出不了图，
-                // 直接进包里从 manifest 声明的 exe / logo 提
-                if (hbmp == IntPtr.Zero && aumid.Contains('!'))
-                {
-                    var packaged = ShellActions.GetPackagedAppIcon(aumid, pixels);
-                    if (packaged != null)
-                    {
-                        lock (_iconLock) _iconCache[aumid + "|" + pixels] = packaged;
-                        return packaged;
-                    }
-                }
-
-                // Office C2R 这类 AUMID 的 AppsFolder 项 shell 解析不了资产，且
-                // .lnk 里也不存 AUMID 属性 —— 按名字找同名 lnk，对目标 exe 提 icon
-                if (hbmp == IntPtr.Zero)
-                {
-                    string target = ShellActions.FindShortcutTargetByName(ResolveName(aumid));
-                    if (target != null) hbmp = NativeShell.GetAppImageHandle(target, pixels);
-                }
-
-                if (hbmp != IntPtr.Zero)
-                {
-                    result = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(
-                        hbmp, IntPtr.Zero,
-                        System.Windows.Int32Rect.Empty,
-                        BitmapSizeOptions.FromEmptyOptions());
-                    result.Freeze();
-                }
-            }
-            catch
-            {
-                result = null;
-            }
-            finally
-            {
-                NativeShell.FreeBitmap(hbmp);
-            }
+            BitmapSource result = ExtractIconChecked(aumid, pixels);
 
             lock (_iconLock)
             {
                 _iconCache[aumid + "|" + pixels] = result;
             }
             return result;
+        }
+
+        /// <summary>
+        /// 带质检的图标提取链。
+        ///
+        /// 坑：shell 对「原生图标太小、撑不起大尺寸请求」的文件（HMCL-3.5.4.exe 只有一个
+        /// 16px 级图标帧），GetImage 不放大而是返回「白页框 + 小图标居中」的文件占位缩略图 ——
+        /// 磁贴上就是一个小点。所以提取结果必须量不透明覆盖率：覆盖率过低判定为假图标，
+        /// 依次降级：包内 logo → 按名字找 lnk 读目标 exe → 48px 真图标（磁贴按 48 DIP 显示，
+        /// WPF 高质量放大，和资源管理器大图标视图同款处理）。
+        /// </summary>
+        private BitmapSource ExtractIconChecked(string aumid, int pixels)
+        {
+            IntPtr hbmp = NativeShell.GetAppImageHandle(aumid, pixels);
+            BitmapSource bmp = ToBitmap(hbmp);
+            NativeShell.FreeBitmap(hbmp);
+
+            if (bmp != null && OpaqueCoverage(bmp) >= 0.35)
+                return bmp;
+
+            // shell 给的是假图标（或没有）：包内 logo（UWP）
+            if (aumid.Contains('!'))
+            {
+                var packaged = ShellActions.GetPackagedAppIcon(aumid, pixels);
+                if (packaged != null) return packaged;
+            }
+
+            // 按名字找同名 lnk，对目标 exe 提 icon（Office C2R 这类）
+            string target = ShellActions.FindShortcutTargetByName(ResolveName(aumid));
+            if (target != null)
+            {
+                hbmp = NativeShell.GetAppImageHandle(target, pixels);
+                var viaLnk = ToBitmap(hbmp);
+                NativeShell.FreeBitmap(hbmp);
+                if (viaLnk != null && OpaqueCoverage(viaLnk) >= 0.35) return viaLnk;
+            }
+
+            // 最后的救命稻草：小尺寸请求能逼 shell 放大原生迷你图标（ICONONLY@48 实测有效）
+            hbmp = NativeShell.GetSmallIconHandle(aumid, 48);
+            var small = ToBitmap(hbmp);
+            NativeShell.FreeBitmap(hbmp);
+            if (small != null && OpaqueCoverage(small) >= 0.3) return small;
+
+            return bmp;   // 兜底到底都失败：至少把第一张（哪怕是假的）交出去，别给空白
+        }
+
+        private static BitmapSource ToBitmap(IntPtr hbmp)
+        {
+            if (hbmp == IntPtr.Zero) return null;
+            try
+            {
+                var bmp = System.Windows.Interop.Imaging.CreateBitmapSourceFromHBitmap(
+                    hbmp, IntPtr.Zero,
+                    System.Windows.Int32Rect.Empty,
+                    BitmapSizeOptions.FromEmptyOptions());
+                bmp.Freeze();
+                return bmp;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 不透明像素占比。正常图标 0.4+；「文件框缩略图」这类假图标只有 0.1~0.2 的框线。
+        /// </summary>
+        internal static double OpaqueCoverage(BitmapSource bmp)
+        {
+            try
+            {
+                int w = bmp.PixelWidth, h = bmp.PixelHeight;
+                if (w == 0 || h == 0) return 0;
+                int stride = w * 4;
+                var px = new byte[stride * h];
+                bmp.CopyPixels(px, stride, 0);
+
+                long opaque = 0;
+                for (int i = 3; i < px.Length; i += 4)
+                    if (px[i] >= 16) opaque++;
+
+                return opaque / (double)(w * h);
+            }
+            catch
+            {
+                return 1;   // 量不了就当它是真图标，别误杀
+            }
         }
 
         /// <summary>按名字哈希出一个稳定的磁贴底色，模拟 Win10 每应用一个主题色。</summary>

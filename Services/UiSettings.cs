@@ -16,13 +16,10 @@ namespace TileBoard.Services
         /// <summary>是否全屏：宽高都等于工作区。</summary>
         public bool FullScreen { get; set; }
 
-        /// <summary>背景不透明度 0.15 ~ 1.0。越低，桌面透得越多。</summary>
+        /// <summary>背景不透明度 0.15 ~ 1.0。越低，桌面透得越多。毛玻璃开着时这层同时是亚克力上的染色。</summary>
         public double BackOpacity { get; set; } = 0.65;
 
-        /// <summary>毛玻璃强度 0 ~ 1。0 表示关掉 DWM 模糊，只剩半透明。</summary>
-        public double BlurStrength { get; set; } = 0.7;
-
-        /// <summary>是否启用亚克力模糊。显卡/远程桌面下若不合适可关掉，退回纯半透明。</summary>
+        /// <summary>是否启用亚克力模糊（系统 DWM）。显卡/远程桌面下若不合适可关掉，退回纯半透明。</summary>
         public bool Acrylic { get; set; } = true;
 
         private static readonly JsonSerializerOptions Options = new JsonSerializerOptions { WriteIndented = true };

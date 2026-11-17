@@ -187,9 +187,6 @@ namespace TileBoard
         // 其余所有几何计算一律用 WorkArea()（即 _screen.Dip），不再碰主屏专属的 SystemParameters.WorkArea
         private Native.Screens.Info _screen;
 
-        /// <summary>毛玻璃底图是用哪块屏的物理矩形抓的。矩形没变就不重抓（省一次全屏 BitBlt）。</summary>
-        private Rect _glassCapturedRect;
-
         /// <summary>当前停靠屏的工作区（DIP）。_screen 还没就绪时退回主屏。</summary>
         private Rect WorkArea() => _screen?.Dip ?? SystemParameters.WorkArea;
 
@@ -323,9 +320,7 @@ namespace TileBoard
                 e.Handled = true;
             };
 
-            // 窗口尺寸/位置一动，垫底那张桌面图就得跟着挪，否则全屏时会整体错位
-            SizeChanged += (s, e) => UpdateGlassPlacement();
-            LocationChanged += (s, e) => UpdateGlassPlacement();
+            // 窗口尺寸/位置变化不再需要挪垫底图 —— 自绘毛玻璃链已退役（2026-11-17）
 
             // 又有人双击了一次 exe：那个实例被单实例挡下，只留这条信号过来
             Native.SingleInstance.ShowRequested += () =>
@@ -566,51 +561,21 @@ namespace TileBoard
             Height = h;
             Left = work.Left;
             Top = work.Top + (work.Height - h);
-
-            // 底图抓的是整块工作区，窗口尺寸怎么变都还在图内 —— 只要把它挪对位置。
-            // 早先这里直接清空底图，所以「切一次全屏毛玻璃就没了」，直到下次唤出才回来。
-            UpdateGlassPlacement();
         }
 
         /// <summary>
-        /// 把垫底的桌面图对到屏幕上：图是整块工作区，窗口只是它的一个子矩形，
-        /// 所以这里按「窗口在屏幕坐标系里的偏移」反向平移，再裁到窗口边界。
-        /// 尺寸、位置一变就得重算 —— 否则全屏时画面会整体错开一截。
-        /// </summary>
-        private void UpdateGlassPlacement()
-        {
-            if (GlassImage == null) return;
-
-            // 底图抓的是 _screen.Physical 那块屏，对位必须用同一块屏的 DIP 工作区
-            Rect work = WorkArea();
-
-            GlassImage.HorizontalAlignment = HorizontalAlignment.Left;
-            GlassImage.VerticalAlignment = VerticalAlignment.Top;
-            GlassImage.Width = Math.Max(1, work.Width);
-            GlassImage.Height = Math.Max(1, work.Height);
-
-            var shift = GlassImage.RenderTransform as TranslateTransform;
-            if (shift == null)
-            {
-                shift = new TranslateTransform();
-                GlassImage.RenderTransform = shift;
-            }
-
-            shift.X = -(Left - work.Left);
-            shift.Y = -(Top - work.Top);
-        }
-
-        /// <summary>
-        /// 应用外观：底色不透明度 + 毛玻璃强度。
+        /// 应用外观：底色不透明度 + 毛玻璃开关（2026-11-17 起为纯系统亚克力）。
         ///
-        /// 毛玻璃这块不再用 DWM 亚克力：它的模糊半径是系统写死的，面板上那个百分比
-        /// 只能改染色深浅，观感就只剩「开/关」两档。现在改成 —— 唤出时截一张背后的桌面，
-        /// 按强度自己缩小+盒式模糊，当作垫底图像。强度才是连续的。
-        /// 抓不到桌面（远程会话、锁屏切换等）才退回 DWM 亚克力。
+        /// 自绘截图模糊链已退役（Glass.cs 删除）：唤出时全屏 BitBlt 的成本、
+        /// 换屏重抓的边界情况、位图缓存管理，全都不再需要。
+        /// 现在模糊完全交给 DWM 亚克力（SetWindowCompositionAttribute）——
+        /// 它的模糊半径系统写死，本来也只有开/关两档，滑块纯属多余。
+        /// 染色厚度由「背景透明度」滑块统一控制：DWM 的 tint 设全透明（0），
+        /// 只留模糊；底色叠在模糊之上，两层各司其职，不会互相加深。
         /// </summary>
         private void ApplyAppearance(IntPtr handle)
         {
-            // 1) 面板底色：alpha 直接由「背景透明度」决定
+            // 1) 面板底色：alpha 直接由「背景透明度」决定 —— 这层同时是亚克力上的染色
             byte a = (byte)Math.Round(255 * Math.Clamp(_ui.BackOpacity, 0.15, 1.0));
             var back = new SolidColorBrush(Color.FromArgb(a, 0x1B, 0x1B, 0x1B));
 
@@ -620,72 +585,17 @@ namespace TileBoard
             if (SettingsPage != null) SettingsPage.Background = back;
             if (PhonePage != null) PhonePage.Background = back;
 
-            double s = Math.Clamp(_ui.BlurStrength, 0, 1);
-
-            // 还没底图、而此刻整窗是透明的（首帧 / 刚启动还没淡入）—— 顺手抓一张。
-            // 窗口不透明的时候绝对不能抓，抓到的会是自己。
-            if (_ui.Acrylic && !Services.Glass.HasImage && RootGrid != null && RootGrid.Opacity < 0.05)
-            {
-                if (Services.Glass.Capture(handle, _screen?.Physical ?? Rect.Empty))
-                {
-                    var g = Services.Glass.Current;
-                    LogHookState2($"Glass capture (apply) {g.PixelWidth}x{g.PixelHeight}");
-                }
-                else LogHookState2("Glass capture (apply) failed");
-            }
-
-            // 2) 总开关关掉：什么模糊都不要，背后是清晰桌面
             if (!_ui.Acrylic)
             {
-                HideGlass();
+                // 总开关关掉：什么模糊都不要，背后是清晰桌面
                 Native.Acrylic.Off(handle);
-                LogHookState2($"Acrylic=off  opacity={_ui.BackOpacity:0.00}  blur=0");
+                LogHookState2($"Acrylic=off  opacity={_ui.BackOpacity:0.00}");
                 return;
             }
 
-            // 3) 自己模糊：强度连续可调
-            if (s > 0.02 && Services.Glass.HasImage)
-            {
-                var bmp = Services.Glass.Render(s);
-                if (bmp != null && GlassImage != null)
-                {
-                    UpdateGlassPlacement();
-                    GlassImage.Source = bmp;
-                    GlassImage.Visibility = Visibility.Visible;
-
-                    // 自家的模糊已经铺满整窗，系统亚克力再糊一遍是纯浪费，而且会和垫图错位
-                    Native.Acrylic.Off(handle);
-
-                    LogHookState2($"Glass=on  strength={s:0.00}  bitmap={bmp.PixelWidth}x{bmp.PixelHeight}  " +
-                                  $"opacity={_ui.BackOpacity:0.00}");
-                    return;
-                }
-            }
-
-            HideGlass();
-
-            // 4) 强度为 0：不模糊，只保留半透明
-            if (s <= 0.02)
-            {
-                Native.Acrylic.Off(handle);
-                LogHookState2($"Glass=off  strength=0  opacity={_ui.BackOpacity:0.00}");
-                return;
-            }
-
-            // 5) 有强度但没抓到桌面：退回 DWM 亚克力，至少还有糊，只是分不出档位
-            byte tint = (byte)Math.Round(255 * (0.9 - 0.55 * s));
-            uint tintAbgr = ((uint)tint << 24) | 0x001A1A1A;
-
-            bool ok = Native.Acrylic.Enable(handle, tintAbgr);
-            LogHookState2($"Acrylic={(ok ? "ok" : "failed")}  fallback  opacity={_ui.BackOpacity:0.00}  " +
-                          $"blur={s:0.00}  tint={tint}");
-        }
-
-        private void HideGlass()
-        {
-            if (GlassImage == null) return;
-            GlassImage.Source = null;
-            GlassImage.Visibility = Visibility.Collapsed;
+            // 2) 开：DWM 亚克力。tint 全透明（alpha=0）—— 模糊归 DWM，染色归上面那层底色
+            bool ok = Native.Acrylic.Enable(handle, 0);
+            LogHookState2($"Acrylic={(ok ? "on" : "failed")} (system)  opacity={_ui.BackOpacity:0.00}");
         }
 
         /// <summary>把外观相关的结果也写进同一份日志，方便排查「为什么看着不透明」。</summary>
@@ -714,7 +624,6 @@ namespace TileBoard
             _appearanceReady = false;
 
             OpacitySlider.Value = Math.Round(Math.Clamp(_ui.BackOpacity, 0.15, 1.0) * 100);
-            BlurSlider.Value = Math.Round(Math.Clamp(_ui.BlurStrength, 0, 1) * 100);
             FullScreenCheck.IsChecked = _ui.FullScreen;
             AcrylicCheck.IsChecked = _ui.Acrylic;
 
@@ -814,7 +723,6 @@ namespace TileBoard
         private void UpdateAppearanceLabels()
         {
             if (OpacityValue != null) OpacityValue.Text = $"{Math.Round(_ui.BackOpacity * 100)}%";
-            if (BlurValue != null) BlurValue.Text = $"{Math.Round(_ui.BlurStrength * 100)}%";
         }
 
         private void OpacitySlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
@@ -822,16 +730,6 @@ namespace TileBoard
             if (!_appearanceReady) return;
 
             _ui.BackOpacity = Math.Clamp(e.NewValue / 100.0, 0.15, 1.0);
-            UpdateAppearanceLabels();
-            ApplyAppearance(new WindowInteropHelper(this).Handle);
-            QueueSettingsSave();
-        }
-
-        private void BlurSlider_ValueChanged(object sender, RoutedPropertyChangedEventArgs<double> e)
-        {
-            if (!_appearanceReady) return;
-
-            _ui.BlurStrength = Math.Clamp(e.NewValue / 100.0, 0, 1);
             UpdateAppearanceLabels();
             ApplyAppearance(new WindowInteropHelper(this).Handle);
             QueueSettingsSave();
@@ -1189,13 +1087,8 @@ namespace TileBoard
             string showProbePath = GetArg("--showprobe");
             if (showProbePath != null) { RunShowProbe(showProbePath); return; }
 
-            // 调试/验收用：--glasstest <txt> 验毛玻璃强度是否连续生效
-            string glassTestPath = GetArg("--glasstest");
-            if (glassTestPath != null) { RunGlassTest(glassTestPath); return; }
-
-            // 调试/验收用：--shotglass <png> 走完「隐藏→抓桌面→唤出」再截图
-            string glassShot = GetArg("--shotglass");
-            if (glassShot != null) { await CaptureGlassShot(glassShot); return; }
+            // （--glasstest / --shotglass / --fullscreentest 三个自检随自绘毛玻璃链
+            //   一同退役，2026-11-17 —— 它们验的都是「垫底图」的存亡与对位）
 
             // 调试/验收用：--shotdrag <png> 拍一张「拖到组外」中途的样子
             string dragShot = GetArg("--shotdrag");
@@ -1216,7 +1109,7 @@ namespace TileBoard
                 ShowSettingsPage();
                 await Task.Delay(400);
                 LogHookState2($"Appearance w={SettingsPage.ActualWidth:0} h={SettingsPage.ActualHeight:0} " +
-                              $"opacity={OpacitySlider.Value:0} blur={BlurSlider.Value:0} full={FullScreenCheck.IsChecked}");
+                              $"opacity={OpacitySlider.Value:0} full={FullScreenCheck.IsChecked}");
 
                 // 顺手把浮层按原尺寸单独存一张，整屏缩略图看不清 11px 的说明文字
                 RevealForCapture();
@@ -1233,9 +1126,7 @@ namespace TileBoard
             string menuDumpPath = GetArg("--menudump");
             if (menuDumpPath != null) { DumpMenus(menuDumpPath); return; }
 
-            // 调试/验收用：--fullscreentest <txt> 开关全屏后毛玻璃还在不在
-            string fsTestPath = GetArg("--fullscreentest");
-            if (fsTestPath != null) { RunFullScreenTest(fsTestPath); return; }
+            // （--fullscreentest 旗标已退役，见上方注释）
 
             // 调试/验收用：--settingtest <txt> 逐个改设置项再断言，验「设置页真的能改」
             string settingTestPath = GetArg("--settingtest");
@@ -1354,6 +1245,8 @@ namespace TileBoard
         private void RunIconTest2(string path)
         {
             var lines = new List<string>();
+            string iconDumpDir = System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(path) ?? ".", "icondump");
             try
             {
                 var aumids = _layout?.Groups?
@@ -1384,8 +1277,29 @@ namespace TileBoard
                               : "")
                         : "";
 
+                    // 内容诊断：算不透明像素的包围盒占画布比例。
+                    // 正常图标应该撑满（≈1.0）；「文件框缩略图」这类假图标只有中间一小块有内容。
+                    string content = "";
+                    if (s256 != null)
+                    {
+                        (double cov, string box) = MeasureContent(s256);
+                        content = $"  内容覆盖={cov:0.00} 包围盒={box}";
+
+                    if (cov < 0.5 && iconDumpDir != null)
+                    {
+                        System.IO.Directory.CreateDirectory(iconDumpDir);
+                        string safe = string.Concat((name ?? "tile")
+                            .Where(ch => !System.IO.Path.GetInvalidFileNameChars().Contains(ch)));
+                        var enc = new PngBitmapEncoder();
+                        enc.Frames.Add(BitmapFrame.Create(s256));
+                        using var fs = System.IO.File.Create(
+                            System.IO.Path.Combine(iconDumpDir, safe + ".png"));
+                        enc.Save(fs);
+                    }
+                    }
+
                     lines.Add($"{(s32 == null ? "缺32" : "  32")}  {(s256 == null ? "缺256" : " 256")}  " +
-                              $"32={fmt(s32)}  256={fmt(s256)}{err}  {name}  [{aumid}]");
+                              $"32={fmt(s32)}  256={fmt(s256)}{content}{err}  {name}  [{aumid}]");
                 }
             }
             catch (Exception ex)
@@ -1395,6 +1309,49 @@ namespace TileBoard
 
             System.IO.File.WriteAllLines(path, lines);
             Application.Current.Shutdown();
+        }
+
+        /// <summary>
+        /// 量一张位图里不透明内容的覆盖率和包围盒。
+        /// 覆盖率低 = 图标画布上大半是透明边距（shell 给的是「文件框缩略图」之类假图标）。
+        /// </summary>
+        private static (double coverage, string box) MeasureContent(BitmapSource bmp)
+        {
+            try
+            {
+                int w = bmp.PixelWidth, h = bmp.PixelHeight;
+                int stride = w * 4;
+                var px = new byte[stride * h];
+                bmp.CopyPixels(px, stride, 0);
+
+                int minX = w, minY = h, maxX = -1, maxY = -1;
+                long opaque = 0, total = (long)w * h;
+
+                for (int y = 0; y < h; y++)
+                {
+                    int row = y * stride;
+                    for (int x = 0; x < w; x++)
+                    {
+                        if (px[row + x * 4 + 3] >= 16)
+                        {
+                            opaque++;
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+                        }
+                    }
+                }
+
+                if (maxX < 0) return (0, "空");
+                double bw = (maxX - minX + 1) / (double)w;
+                double bh = (maxY - minY + 1) / (double)h;
+                return (opaque / (double)total, $"{bw:0.00}x{bh:0.00} @({minX},{minY})");
+            }
+            catch (Exception ex)
+            {
+                return (-1, "ERR " + ex.Message);
+            }
         }
 
         /// <summary>
@@ -2637,103 +2594,6 @@ namespace TileBoard
         }
 
         /// <summary>
-        /// 走真实的唤出流程再截图：先 Hide（这样抓屏幕抓不到自己），
-        /// 再 ShowBoard（内部会抓桌面、生成模糊底图），最后整窗渲染成 PNG。
-        /// </summary>
-        private async Task CaptureGlassShot(string path)
-        {
-            await Task.Delay(1200);
-
-            Hide();
-            await Task.Delay(150);
-
-            ShowBoard();
-            await Task.Delay(600);
-
-            var src = GlassImage?.Source as BitmapSource;
-            LogHookState2($"GlassShot vis={GlassImage?.Visibility} 底图=" +
-                          (src != null ? $"{src.PixelWidth}x{src.PixelHeight}" : "NULL") +
-                          $" 强度={_ui.BlurStrength:0.00} 透明度={_ui.BackOpacity:0.00}");
-
-            RevealForCapture();
-            SaveRootPng(path);
-            Application.Current.Shutdown();
-        }
-
-        /// <summary>
-        /// 回归自检：开关全屏之后垫底的桌面图还在不在、有没有对到正确位置。
-        /// 之前这里会把底图整块作废，表现就是「切一次全屏毛玻璃就没了」。
-        /// 结束时把用户的尺寸设置原样写回去，自检不留痕。
-        /// </summary>
-        private async void RunFullScreenTest(string path)
-        {
-            var lines = new List<string>();
-
-            bool oldFull = _ui.FullScreen;
-            double oldW = _ui.PanelWidth;
-            double oldH = _ui.PanelHeight;
-
-            try
-            {
-                await Task.Delay(400);
-
-                Hide();
-                await Task.Delay(120);
-                ShowBoard();                 // 走真实唤出：先抓桌面，再显示
-                await Task.Delay(400);
-
-                void Snap(string label)
-                {
-                    bool has = GlassImage.Source != null;
-                    string vis = GlassImage.Visibility.ToString();
-                    var shift = GlassImage.RenderTransform as System.Windows.Media.TranslateTransform;
-                    Rect work = SystemParameters.WorkArea;
-
-                    bool placed = shift != null
-                                  && Math.Abs(shift.X + (Left - work.Left)) < 0.6
-                                  && Math.Abs(shift.Y + (Top - work.Top)) < 0.6
-                                  && Math.Abs(GlassImage.Width - work.Width) < 0.6
-                                  && Math.Abs(GlassImage.Height - work.Height) < 0.6;
-
-                    lines.Add($"{label,-10} 窗口={Width:0}x{Height:0}  图存在={has}  " +
-                              $"可见={vis}  图尺寸={GlassImage.Width:0}x{GlassImage.Height:0}  " +
-                              $"位置对齐={(placed ? "✔" : "✘")}");
-
-                    if (!has || vis != "Visible") lines.Add("    ✘ 毛玻璃丢了");
-                }
-
-                Snap("初始");
-
-                ToggleFullScreen();
-                await Task.Delay(300);
-                Snap("切到全屏");
-
-                ToggleFullScreen();
-                await Task.Delay(300);
-                Snap("退出全屏");
-
-                lines.Add("——");
-                lines.Add("期望：三种状态下 图存在=True、可见=Visible、位置对齐=✔");
-            }
-            catch (Exception ex)
-            {
-                lines.Add("EXCEPTION " + ex);
-            }
-            finally
-            {
-                _ui.FullScreen = oldFull;
-                _ui.PanelWidth = oldW;
-                _ui.PanelHeight = oldH;
-                _ui.Save();
-                ApplyWin10Geometry();
-                UpdateGroupLayout();
-
-                System.IO.File.WriteAllText(path, string.Join("\n", lines));
-                Application.Current.Shutdown();
-            }
-        }
-
-        /// <summary>
         /// 设置页功能自检：把每个控件都改一遍，然后看窗口/设置/注册表是不是真的跟着动了。
         /// 截图只能证明「画出来了」，证明不了「拖了有用」—— 这一节验的是后者。
         /// 跑完把用户原来的设置原样写回去。
@@ -2746,7 +2606,6 @@ namespace TileBoard
             double oldW = _ui.PanelWidth;
             double oldH = _ui.PanelHeight;
             double oldOpacity = _ui.BackOpacity;
-            double oldBlur = _ui.BlurStrength;
             bool oldAcrylic = _ui.Acrylic;
             bool oldAutostart = Services.Autostart.IsEnabled();
 
@@ -2795,20 +2654,16 @@ namespace TileBoard
                 // 毛玻璃总开关
                 AcrylicCheck.IsChecked = false;
                 await Task.Delay(150);
-                Check("关毛玻璃", !_ui.Acrylic && GlassImage.Visibility != Visibility.Visible,
-                      $"acrylic={_ui.Acrylic} 图={GlassImage.Visibility}");
+                Check("关毛玻璃", !_ui.Acrylic, $"acrylic={_ui.Acrylic}");
                 AcrylicCheck.IsChecked = true;
                 await Task.Delay(150);
-                Check("开毛玻璃", _ui.Acrylic, $"acrylic={_ui.Acrylic} 图={GlassImage.Visibility}");
+                Check("开毛玻璃", _ui.Acrylic, $"acrylic={_ui.Acrylic}");
 
-                // 透明度 / 强度
+                // 透明度
                 OpacitySlider.Value = 42;
-                BlurSlider.Value = 66;
                 await Task.Delay(150);
                 Check("透明度滑块", Math.Abs(_ui.BackOpacity - 0.42) < 0.011,
                       $"{_ui.BackOpacity:0.00}");
-                Check("强度滑块", Math.Abs(_ui.BlurStrength - 0.66) < 0.011,
-                      $"{_ui.BlurStrength:0.00}");
 
                 // 自启
                 AutostartCheck.IsChecked = false;
@@ -2818,14 +2673,14 @@ namespace TileBoard
                 await Task.Delay(120);
                 Check("开自启", Services.Autostart.IsEnabled(), "");
 
-                // 全屏来回切两次，看毛玻璃还在不在
+                // 全屏来回切两次，看几何是否收放正常
                 FullScreenCheck.IsChecked = true;
                 await Task.Delay(250);
-                bool ok1 = GlassImage.Source != null && GlassImage.Visibility == Visibility.Visible;
+                bool ok1 = _ui.FullScreen;
                 FullScreenCheck.IsChecked = false;
                 await Task.Delay(250);
-                bool ok2 = GlassImage.Source != null && GlassImage.Visibility == Visibility.Visible;
-                Check("切全屏后毛玻璃", ok1 && ok2, $"全屏={ok1} 退出={ok2}");
+                bool ok2 = !_ui.FullScreen;
+                Check("全屏开关", ok1 && ok2, $"全屏={ok1} 退出={ok2}");
             }
             catch (Exception ex)
             {
@@ -2837,7 +2692,6 @@ namespace TileBoard
                 _ui.PanelWidth = oldW;
                 _ui.PanelHeight = oldH;
                 _ui.BackOpacity = oldOpacity;
-                _ui.BlurStrength = oldBlur;
                 _ui.Acrylic = oldAcrylic;
                 _ui.Save();
 
@@ -2986,163 +2840,6 @@ namespace TileBoard
             Application.Current.Shutdown();
         }
 
-
-        /// <summary>
-        /// 毛玻璃强度自检：真截一张桌面，再按不同强度生成底图，
-        /// 用「相邻像素平均梯度」度量糊到什么程度 —— 强度上去，这个数必须单调下降。
-        /// 只会做出「模糊开/关」的实现，这串数字会是平的。
-        /// </summary>
-        private async void RunGlassTest(string path)
-        {
-            await Task.Delay(600);
-
-            var lines = new List<string>();
-            string dir = System.IO.Path.GetDirectoryName(path) ?? ".";
-            string stem = System.IO.Path.Combine(dir, System.IO.Path.GetFileNameWithoutExtension(path));
-
-            try
-            {
-                bool got = Glass.Capture(new WindowInteropHelper(this).Handle);
-                var raw = Glass.Current;
-                lines.Add("capture = " + (got && raw != null
-                    ? $"{raw.PixelWidth}x{raw.PixelHeight} ✔" : "失败 ✘"));
-
-                if (raw != null)
-                {
-                    SaveBitmap(raw, stem + "-raw.png");
-
-                    // 真实桌面可能是一整块纯色（暗色壁纸），拿它当尺子量不出强弱。
-                    // 再拿一张带细节的合成图跑一遍，验的是算法本身。
-                    var probe = MakeDetailProbe(Math.Min(1600, raw.PixelWidth),
-                                                Math.Min(900, raw.PixelHeight));
-
-                    double last = double.MaxValue;
-                    bool monotonic = true;
-
-                    lines.Add("—— 合成细节图（验算法）——");
-
-                    foreach (double s in new[] { 0.0, 0.1, 0.3, 0.5, 0.7, 1.0 })
-                    {
-                        var bmp = Glass.RenderFrom(probe, s);
-                        double sharp = Sharpness(bmp);
-                        if (sharp > last + 0.05) monotonic = false;
-                        last = sharp;
-
-                        lines.Add($"强度={s:0.0}  底图={bmp.PixelWidth}x{bmp.PixelHeight}  相邻梯度={sharp:0.00}");
-
-                        if (s < 0.05 || Math.Abs(s - 0.5) < 0.01 || s > 0.99)
-                            SaveBitmap(bmp, $"{stem}-{s:0.0}.png");
-                    }
-
-                    lines.Add("单调下降 = " + (monotonic ? "✔ 强度真的在影响画面" : "✘ 滑块没起作用"));
-
-                    lines.Add("—— 真实桌面 ——");
-                    foreach (double s in new[] { 0.0, 0.3, 1.0 })
-                    {
-                        var bmp = Glass.RenderFrom(raw, s);
-                        lines.Add($"强度={s:0.0}  底图={bmp.PixelWidth}x{bmp.PixelHeight}  相邻梯度={Sharpness(bmp):0.00}");
-                    }
-
-                    // 拖滑块时每一档都要重新出图，耗时必须足够小，否则手感是"一格一格卡"
-                    var sw = Stopwatch.StartNew();
-                    Glass.Render(0.35);
-                    double first = sw.Elapsed.TotalMilliseconds;
-                    sw.Restart();
-                    Glass.Render(0.36);          // 同一档位：应当命中缓存
-                    double second = sw.Elapsed.TotalMilliseconds;
-                    lines.Add($"耗时  首次={first:0.0}ms  同档再取={second:0.0}ms（档数 {Glass.DivFor(0.0)}~{Glass.DivFor(1.0)}）");
-                }
-            }
-            catch (Exception ex)
-            {
-                lines.Add("EX " + ex.GetType().Name + " " + ex.Message);
-            }
-
-            System.IO.Directory.CreateDirectory(dir);
-            System.IO.File.WriteAllLines(path, lines);
-            Application.Current.Shutdown();
-        }
-
-        /// <summary>自检用：一张混合了高/中/低空间频率的图，用来量模糊程度。真实桌面可能是一整块纯色，量不出东西。</summary>
-        private static BitmapSource MakeDetailProbe(int w, int h)
-        {
-            int stride = w * 4;
-            var px = new byte[stride * h];
-
-            for (int y = 0; y < h; y++)
-            {
-                for (int x = 0; x < w; x++)
-                {
-                    int i = y * stride + x * 4;
-
-                    bool check = ((x / 2) + (y / 2)) % 2 == 0;      // 2px 棋盘格（最高频）
-                    int band = ((x / 40) + (y / 40)) % 6;           // 40px 色块（中频）
-                    int v = check ? 45 + band * 32 : 150 + band * 12;
-
-                    if (((x - y) % 90 + 90) % 90 < 3) v = 240;      // 细斜线
-
-                    px[i] = (byte)Math.Clamp(v, 0, 255);
-                    px[i + 1] = (byte)Math.Clamp(255 - v / 2, 0, 255);
-                    px[i + 2] = (byte)Math.Clamp(v, 0, 255);
-                    px[i + 3] = 255;
-                }
-            }
-
-            var bmp = BitmapSource.Create(w, h, 96, 96, PixelFormats.Pbgra32, null, px, stride);
-            bmp.Freeze();
-            return bmp;
-        }
-
-        /// <summary>
-        /// 相邻像素平均绝对差（取蓝通道）。越小＝越糊。
-        /// 先统一拉到 1024 宽再量：底图尺寸随强度变化，直接比小图的梯度等于比不同尺子，
-        /// 而用户看到的是拉回窗口尺寸之后的效果。
-        /// </summary>
-        private static double Sharpness(BitmapSource bmp)
-        {
-            if (bmp == null) return 0;
-
-            const int normWidth = 1024;
-            if (Math.Abs(bmp.PixelWidth - normWidth) > 1)
-            {
-                // 走和 Image 控件同一条 HighQuality 缩放路径，量到的才是屏幕上真正的观感
-                double kh = (double)bmp.PixelHeight * normWidth / bmp.PixelWidth;
-                int nh = Math.Max(1, (int)Math.Round(kh));
-
-                var dv = new DrawingVisual();
-                using (var dc = dv.RenderOpen())
-                {
-                    RenderOptions.SetBitmapScalingMode(dv, BitmapScalingMode.HighQuality);
-                    dc.DrawImage(bmp, new Rect(0, 0, normWidth, nh));
-                }
-
-                var rtb = new RenderTargetBitmap(normWidth, nh, 96, 96, PixelFormats.Pbgra32);
-                rtb.Render(dv);
-                if (rtb.CanFreeze) rtb.Freeze();
-                bmp = rtb;
-            }
-
-            int w = bmp.PixelWidth, h = bmp.PixelHeight;
-            int stride = w * 4;
-            var px = new byte[stride * h];
-            bmp.CopyPixels(px, stride, 0);
-
-            long sum = 0, n = 0;
-            int stepY = Math.Max(1, h / 140);
-
-            for (int y = 0; y < h; y += stepY)
-            {
-                int row = y * stride;
-                for (int x = 4; x < w; x += 3)
-                {
-                    int i = row + x * 4;
-                    sum += Math.Abs(px[i] - px[i - 4]);
-                    n++;
-                }
-            }
-
-            return n == 0 ? 0 : (double)sum / n;
-        }
 
         /// <summary>不走鼠标，直接把「抓起分组 → 吸附格位 → 挤开邻居」跑一遍。</summary>
         private async void RunGroupTest(string path)
@@ -3526,29 +3223,6 @@ namespace TileBoard
             RootShift.BeginAnimation(TranslateTransform.YProperty, null);
             RootGrid.Opacity = 0;
             RootShift.Y = 10;
-
-            // 抓毛玻璃底图必须赶在本窗口重新可见之前：此刻屏幕上是真桌面，抓不到自己。
-            // 底图按整块工作区抓，面板永远是它的子矩形，所以同一块屏抓一次就够 ——
-            // 面板现在锁死在固定屏上，桌面对我们来说只是「模糊的背景」，没必要每次
-            // 唤出都全屏 BitBlt 一遍（2560x1392 一抓 30~60ms，还把模糊档位缓存全冲掉）。
-            // 只有第一次、或屏幕矩形变了（换分辨率、改工作区）才重抓。
-            if (_ui.Acrylic)
-            {
-                Rect phys = _screen?.Physical ?? Rect.Empty;
-                bool needRecapture = !Services.Glass.HasImage
-                                     || !phys.Equals(_glassCapturedRect);
-
-                if (needRecapture)
-                {
-                    bool got = Services.Glass.Capture(new WindowInteropHelper(this).Handle, phys);
-                    var raw = Services.Glass.Current;
-                    LogHookState2(got && raw != null
-                        ? $"Glass capture {raw.PixelWidth}x{raw.PixelHeight}"
-                        : "Glass capture failed -> 退回 DWM 亚克力");
-
-                    _glassCapturedRect = got ? phys : Rect.Empty;
-                }
-            }
 
             ApplyAppearance(new WindowInteropHelper(this).Handle);
 

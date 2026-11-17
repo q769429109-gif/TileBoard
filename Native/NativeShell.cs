@@ -223,6 +223,21 @@ namespace TileBoard.Native
             yield return id;
         }
 
+        /// <summary>
+        /// 小尺寸纯图标请求：ICONONLY 不带 BIGGERSIZEOK。
+        /// shell 对小尺寸肯放大原生迷你图标，对 256px 大请求只会甩「文件框缩略图」。
+        /// 是假图标质检失败后的救命通道。
+        /// </summary>
+        public static IntPtr GetSmallIconHandle(string aumid, int pixels)
+        {
+            foreach (string parsing in ParsingCandidates(aumid))
+            {
+                IntPtr hbmp = GetImageRaw(parsing, pixels, SIIGBF_ICONONLY, out _);
+                if (hbmp != IntPtr.Zero) return hbmp;
+            }
+            return IntPtr.Zero;
+        }
+
         /// <summary>取某个应用的 256px 图标位图句柄；失败返回 IntPtr.Zero。</summary>
         public static IntPtr GetAppImageHandle(string aumid, int pixels)
         {
@@ -231,37 +246,49 @@ namespace TileBoard.Native
 
             foreach (string parsing in ParsingCandidates(aumid))
             {
-                object obj = null;
-                IntPtr hbmp = IntPtr.Zero;
-                try
-                {
-                    Guid iid = typeof(IShellItemImageFactory).GUID;
-                    object shItem;
-                    SHCreateItemFromParsingName(parsing, IntPtr.Zero, ref iid, out shItem);
-                    obj = shItem;
-                    var factory = (IShellItemImageFactory)shItem;
+                IntPtr hbmp = GetImageRaw(parsing, pixels,
+                    SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, out string err1);
+                if (hbmp != IntPtr.Zero) return hbmp;
 
-                    // 先只取图标。UWP 的 AppsFolder 项经常不走图标处理器
-                    // （SIIGBF_ICONONLY 直接 E_FAIL），这时去掉 ICONONLY 重试 ——
-                    // shell 会回退到应用 logo / 缩略图，照样能出 256px 的图
-                    factory.GetImage(new SIZE(pixels, pixels),
-                        SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK, out hbmp);
-                    if (hbmp == IntPtr.Zero)
-                        factory.GetImage(new SIZE(pixels, pixels),
-                            SIIGBF_BIGGERSIZEOK, out hbmp);
-                    if (hbmp != IntPtr.Zero) return hbmp;
-                }
-                catch (Exception ex)
-                {
-                    LastError = ex.GetType().Name + ": " + ex.Message.Trim();
-                }
-                finally
-                {
-                    if (obj != null) Marshal.ReleaseComObject(obj);
-                }
+                hbmp = GetImageRaw(parsing, pixels, SIIGBF_BIGGERSIZEOK, out string err2);
+                if (hbmp != IntPtr.Zero) return hbmp;
+
+                LastError = err1 ?? err2;
             }
 
             return IntPtr.Zero;
+        }
+
+        /// <summary>
+        /// 单次 GetImage，flag 由调用方给定。探针与主链路共用。
+        /// parsing 可为磁盘路径或 shell:AppsFolder 形式的 ID。
+        /// </summary>
+        public static IntPtr GetImageRaw(string parsing, int pixels, int flags, out string error)
+        {
+            error = null;
+            if (string.IsNullOrWhiteSpace(parsing)) return IntPtr.Zero;
+
+            object obj = null;
+            try
+            {
+                Guid iid = typeof(IShellItemImageFactory).GUID;
+                object shItem;
+                SHCreateItemFromParsingName(parsing, IntPtr.Zero, ref iid, out shItem);
+                obj = shItem;
+                var factory = (IShellItemImageFactory)shItem;
+
+                factory.GetImage(new SIZE(pixels, pixels), flags, out IntPtr hbmp);
+                return hbmp;
+            }
+            catch (Exception ex)
+            {
+                error = ex.GetType().Name + ": " + ex.Message.Trim();
+                return IntPtr.Zero;
+            }
+            finally
+            {
+                if (obj != null) Marshal.ReleaseComObject(obj);
+            }
         }
 
         public static void FreeBitmap(IntPtr hbmp)
