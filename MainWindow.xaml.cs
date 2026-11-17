@@ -1365,16 +1365,24 @@ namespace TileBoard
             bool want = AutostartCheck.IsChecked == true;
             bool ok = want ? Services.Autostart.Enable() : Services.Autostart.Disable();
 
+            string detail = Services.Autostart.LastDetail;
+            LogHookState2($"autostart {(want ? "enable" : "disable")} ok={ok} :: {detail}");
+
             if (!ok)
             {
                 _appearanceReady = false;
                 AutostartCheck.IsChecked = Services.Autostart.IsEnabled();
                 _appearanceReady = true;
-                SetStatus("自启项写入失败");
+                // 不再只说「写入失败」：把三层途径的原始错误摊给用户看，
+                // 否则换台机器出问题又得从头猜一遍
+                SetStatus(string.IsNullOrEmpty(detail) ? "自启项写入失败" : "自启失败：" + detail);
                 return;
             }
 
-            SetStatus(want ? "已设为开机自启" : "已取消开机自启");
+            if (want && Services.Autostart.LastUsedRunKeyFallback)
+                SetStatus("已开启，但计划任务被系统拒绝，改用注册表自启（开机后 1~3 分钟才出现）");
+            else
+                SetStatus(want ? "已设为开机自启" : "已取消开机自启");
         }
 
         private void SettingsBack_Click(object sender, RoutedEventArgs e)
@@ -1602,7 +1610,8 @@ namespace TileBoard
             if (HasFlag("--autostart-on"))
             {
                 bool ok = Services.Autostart.Enable();
-                LogHookState2($"autostart enable: {(ok ? "ok" : "FAILED")} -> " +
+                LogHookState2($"autostart enable: {(ok ? "ok" : "FAILED")} :: " +
+                              Services.Autostart.LastDetail + " -> " +
                               Services.Autostart.CommandPreview());
             }
             if (HasFlag("--autostart-off"))
