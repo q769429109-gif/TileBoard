@@ -70,6 +70,13 @@
         <Style TargetType="ScrollBar" BasedOn="{StaticResource Win10ScrollBar}"/>
 
         <!-- 左侧图标栏按钮 -->
+        <!-- 圆形头像遮罩：ClipToBounds 只裁矩形边，径向渐变裁真圆，0.999→1 过渡带抹锯齿 -->
+        <RadialGradientBrush x:Key="CircleClipMask" Center="0.5,0.5" GradientOrigin="0.5,0.5"
+                             RadiusX="0.5" RadiusY="0.5">
+            <GradientStop Color="#FF000000" Offset="0.999"/>
+            <GradientStop Color="#00000000" Offset="1"/>
+        </RadialGradientBrush>
+
         <Style x:Key="RailButton" TargetType="Button">
             <Setter Property="Width" Value="40"/>
             <Setter Property="Height" Value="40"/>

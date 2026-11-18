@@ -63,6 +63,18 @@
                 </StackPanel>
 
                 <StackPanel VerticalAlignment="Bottom" Margin="0,0,0,10">
+                    <!-- 头像：Win10 收起态左栏也挂账号头像，点它就展开侧栏（用户区在底部） -->
+                    <Button x:Name="BtnAvatar" Style="{StaticResource RailButton}"
+                            ToolTip="开始" Click="BtnAvatar_Click">
+                        <Grid Width="26" Height="26">
+                            <Image x:Name="RailAvatar" Stretch="UniformToFill"
+                                   Visibility="Collapsed"
+                                   OpacityMask="{StaticResource CircleClipMask}"/>
+                            <TextBlock x:Name="RailAvatarGlyph" Text="&#xE77B;"
+                                       FontFamily="Segoe MDL2 Assets" FontSize="14"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Grid>
+                    </Button>
                     <!-- 应用库：可搜索、可把应用拖到板上。和上面的「所有应用」是两套界面 -->
                     <Button x:Name="BtnLibrary" Style="{StaticResource RailButton}"
                             Content="&#xE8F1;" ToolTip="应用库"
@@ -71,8 +83,6 @@
                             Content="&#xE8EA;" ToolTip="移动设备" Click="BtnPhone_Click"/>
                     <Button x:Name="BtnDocuments" Style="{StaticResource RailButton}"
                             Content="&#xE8B7;" ToolTip="文档" Click="BtnDocuments_Click"/>
-                    <Button x:Name="BtnTools" Style="{StaticResource RailButton}"
-                            Content="&#xE712;" ToolTip="工具" Click="BtnTools_Click"/>
                     <Button x:Name="BtnAppearance" Style="{StaticResource RailButton}"
                             Content="&#xE790;" ToolTip="个性化" Click="BtnAppearance_Click"/>
                     <Button x:Name="BtnSettings" Style="{StaticResource RailButton}"
@@ -276,6 +286,19 @@
                                   ToolTip="登录后后台待命，按 Win 键唤出"
                                   Checked="AutostartCheck_Changed"
                                   Unchecked="AutostartCheck_Changed"/>
+
+                        <Border Height="1" Background="#1FFFFFFF" Margin="0,24,0,22"/>
+
+                        <!-- ===== 布局文件 ===== -->
+                        <TextBlock Text="布局文件" FontSize="13" FontWeight="SemiBold"
+                                   Foreground="#EDEDED" Margin="0,0,0,12"/>
+
+                        <Button Content="打开布局文件位置…"
+                                Style="{StaticResource FlatButton}"
+                                ToolTip="在资源管理器中打开 layout.json 所在目录"
+                                Click="OpenLayoutDir_Click"/>
+                        <TextBlock Text="布局、应用缓存和窗口位置都存在这个目录里"
+                                   FontSize="11" Foreground="#858585" Margin="0,6,0,0"/>
                     </StackPanel>
                 </ScrollViewer>
             </Grid>
@@ -563,24 +586,46 @@
                 <StackPanel Grid.Row="1" VerticalAlignment="Bottom" Margin="0,0,0,10">
                     <Border Height="1" Background="#14FFFFFF" Margin="0,0,0,10"/>
 
-                    <Grid Height="44" Margin="16,0,16,4" Background="Transparent">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                        </Grid.ColumnDefinitions>
+                    <!-- 用户行：真头像 + 全名，点击进系统「你的信息」。整行当按钮用，悬停跟宽版按钮同款底色 -->
+                    <Border Height="44" Margin="16,0,16,4"
+                            Cursor="Hand" ToolTip="账户设置"
+                            MouseLeftButtonUp="StartUser_Click">
+                        <Border.Style>
+                            <Style TargetType="Border">
+                                <Setter Property="Background" Value="Transparent"/>
+                                <Style.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True">
+                                        <Setter Property="Background" Value="#2A2A2A"/>
+                                    </Trigger>
+                                </Style.Triggers>
+                            </Style>
+                        </Border.Style>
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto"/>
+                                <ColumnDefinition Width="*"/>
+                            </Grid.ColumnDefinitions>
 
-                        <Border Width="30" Height="30" CornerRadius="15" Background="#3A3A3A"
-                                VerticalAlignment="Center">
-                            <TextBlock Text="&#xE77B;" FontFamily="Segoe MDL2 Assets" FontSize="15"
-                                       Foreground="#D8D8D8"
-                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
-                        </Border>
+                            <Border Width="30" Height="30" CornerRadius="15" Background="#3A3A3A"
+                                    VerticalAlignment="Center" ClipToBounds="True">
+                                <Grid>
+                                    <!-- 圆形遮罩在 App.xaml 的 CircleClipMask（ClipToBounds 裁不了圆角） -->
+                                    <Image x:Name="StartAvatar" Stretch="UniformToFill"
+                                           Visibility="Collapsed"
+                                           OpacityMask="{StaticResource CircleClipMask}"/>
+                                    <TextBlock x:Name="StartAvatarGlyph" Text="&#xE77B;"
+                                               FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                               Foreground="#D8D8D8"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                </Grid>
+                            </Border>
 
-                        <TextBlock x:Name="StartUser" Grid.Column="1" Text=""
-                                   FontSize="12.5" Foreground="#EDEDED"
-                                   VerticalAlignment="Center" Margin="12,0,0,0"
-                                   TextTrimming="CharacterEllipsis"/>
-                    </Grid>
+                            <TextBlock x:Name="StartUser" Grid.Column="1" Text=""
+                                       FontSize="12.5" Foreground="#EDEDED"
+                                       VerticalAlignment="Center" Margin="12,0,0,0"
+                                       TextTrimming="CharacterEllipsis"/>
+                        </Grid>
+                    </Border>
                     <Border Style="{StaticResource StartNavItem}" Tag="library"
                             MouseLeftButtonUp="StartNav_Click">
                         <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
@@ -610,17 +655,6 @@
                                        Foreground="#EDEDED" VerticalAlignment="Center"
                                        IsHitTestVisible="False"/>
                             <TextBlock Text="文档" FontSize="12.5" Foreground="#EDEDED"
-                                       Margin="16,0,0,0" VerticalAlignment="Center"
-                                       IsHitTestVisible="False"/>
-                        </StackPanel>
-                    </Border>
-                    <Border Style="{StaticResource StartNavItem}" Tag="tools"
-                            MouseLeftButtonUp="StartNav_Click">
-                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
-                            <TextBlock Text="&#xE712;" FontFamily="Segoe MDL2 Assets" FontSize="15"
-                                       Foreground="#EDEDED" VerticalAlignment="Center"
-                                       IsHitTestVisible="False"/>
-                            <TextBlock Text="工具" FontSize="12.5" Foreground="#EDEDED"
                                        Margin="16,0,0,0" VerticalAlignment="Center"
                                        IsHitTestVisible="False"/>
                         </StackPanel>

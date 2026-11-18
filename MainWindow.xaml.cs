@@ -445,6 +445,9 @@ namespace TileBoard
         private const int SM_CYDOUBLECLK = 37;      // 双击判定的纵向容差（像素）
         [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern IntPtr FindWindowW(string cls, string title);
+        // secur32：拿本地账号的「全名」（控制面板里那个显示名，如 xingchen chen）。NameDisplay = 3
+        [DllImport("secur32.dll", CharSet = CharSet.Unicode)]
+        private static extern bool GetUserNameEx(int nameFormat, System.Text.StringBuilder userName, ref uint bufferSize);
         [DllImport("dwmapi.dll")] private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
         [DllImport("user32.dll")] private static extern int GetWindowLong(IntPtr hWnd, int nIndex);
         [DllImport("user32.dll")] private static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
@@ -598,8 +601,9 @@ namespace TileBoard
                 Dispatcher.BeginInvoke(new Action(() =>
                 {
                     LogHookState2("show requested by another launch");
-                    HideSettingsPage(false);
-                    HidePhonePage();
+                    SnapPageClosed(SettingsPage);
+                    SnapPageClosed(PhonePage);
+                    RestoreBoardIfPagesClosed();
 
                     // 资源管理器右键「固定到磁贴」也是走这条信号，路径在队列里
                     if (HandlePinRequests()) return;
@@ -1233,8 +1237,15 @@ namespace TileBoard
         /// </summary>
         private void ShowPageOver(FrameworkElement page)
         {
+            // 整页和侧栏、应用库互斥：谁开着都先收干净，不然叠在页面底下当背景。
+            // 收走时都不亮板面 —— 整页马上盖上来，亮了也是白亮
+            if (StartPane.Visibility == Visibility.Visible) HideStartPane(false);
+            if (AppsPanel.Visibility == Visibility.Visible) HideAppsPanel(false);
+
             BoardSurface.Visibility = Visibility.Collapsed;
             page.Visibility = Visibility.Visible;
+            // 与应用库同款：淡入 + 左滑，首帧布局吃在 Opacity=0 阶段
+            AnimatePageSlide(page, true);
         }
 
         private static void ShowBoardSurface(UIElement board)
@@ -1246,20 +1257,103 @@ namespace TileBoard
         {
             bool wasOpen = SettingsPage.Visibility == Visibility.Visible;
 
-            SettingsPage.Visibility = Visibility.Collapsed;
-            if (wasOpen) ShowBoardSurface(BoardSurface);
+            if (wasOpen)
+            {
+                // 控件里的值已经是最新，先存再演动画；磁贴区等收尾回调再亮
+                if (save) _ui.Save();
+                AnimatePageSlide(SettingsPage, false, RestoreBoardIfPagesClosed);
+            }
             SetRailActive(BtnAppearance, false);
-
-            if (wasOpen && save) _ui.Save();
         }
 
         private void HidePhonePage()
         {
             bool wasOpen = PhonePage.Visibility == Visibility.Visible;
-
-            PhonePage.Visibility = Visibility.Collapsed;
-            if (wasOpen) ShowBoardSurface(BoardSurface);
+            if (wasOpen) AnimatePageSlide(PhonePage, false, RestoreBoardIfPagesClosed);
             SetRailActive(BtnPhone, false);
+        }
+
+        // ===== 整页动画：个性化 / 移动设备与应用库同一套出场节奏 =====
+        // 每页独立序号：设置页淡出还没落地、用户又点了手机页时，两页动画并行，
+        // 共用一个序号会把先收那页的收尾回调顶掉 —— 页面就永远收不干净了。
+
+        private readonly Dictionary<FrameworkElement, int> _pageSeqs = new Dictionary<FrameworkElement, int>();
+
+        /// <summary>
+        /// 整页淡入淡出 + 左侧 18px 滑入，参数与应用库面板完全一致。
+        /// show 前先把 Opacity 归零并 UpdateLayout，把首帧布局吃在看不见的阶段。
+        /// </summary>
+        private void AnimatePageSlide(FrameworkElement page, bool show, Action onClosed = null)
+        {
+            _pageSeqs.TryGetValue(page, out int prev);
+            int seq = prev + 1;
+            _pageSeqs[page] = seq;
+
+            var shift = page.RenderTransform as TranslateTransform;
+            if (shift == null)
+            {
+                shift = new TranslateTransform();
+                page.RenderTransform = shift;
+            }
+
+            page.IsHitTestVisible = show;
+
+            if (show)
+            {
+                // 上一轮持有动画会顶住本地值，先清掉再摆起手姿态
+                page.BeginAnimation(UIElement.OpacityProperty, null);
+                page.Opacity = 0;
+                shift.BeginAnimation(TranslateTransform.XProperty, null);
+                shift.X = -18;
+                page.UpdateLayout();
+            }
+
+            var fade = new DoubleAnimation(show ? 1 : 0,
+                TimeSpan.FromMilliseconds(show ? 190 : 130))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+
+            var slide = new DoubleAnimation(show ? 0 : -14,
+                TimeSpan.FromMilliseconds(show ? 240 : 140))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+
+            if (!show)
+            {
+                fade.Completed += (s, e) =>
+                {
+                    if (_pageSeqs.TryGetValue(page, out int latest) && latest != seq) return;
+                    SnapPageClosed(page);
+                    onClosed?.Invoke();
+                };
+            }
+
+            page.BeginAnimation(UIElement.OpacityProperty, fade);
+            shift.BeginAnimation(TranslateTransform.XProperty, slide);
+        }
+
+        /// <summary>整页立即收：清掉在途动画，回到 Collapsed 的干净状态。唤出（Win 键）路径用这个。</summary>
+        private void SnapPageClosed(FrameworkElement page)
+        {
+            page.BeginAnimation(UIElement.OpacityProperty, null);
+            page.Opacity = 1;
+            page.Visibility = Visibility.Collapsed;
+            page.IsHitTestVisible = true;
+            if (page.RenderTransform is TranslateTransform shift)
+            {
+                shift.BeginAnimation(TranslateTransform.XProperty, null);
+                shift.X = 0;
+            }
+        }
+
+        /// <summary>两块整页都收干净了才把磁贴区亮回来 —— 页面底色带 alpha，板面还摆着会透出磁贴。</summary>
+        private void RestoreBoardIfPagesClosed()
+        {
+            if (SettingsPage.Visibility != Visibility.Visible &&
+                PhonePage.Visibility != Visibility.Visible)
+                ShowBoardSurface(BoardSurface);
         }
 
         /// <summary>当前页对应的侧边栏按钮压亮，否则看不出自己在哪一页。</summary>
@@ -1611,6 +1705,9 @@ namespace TileBoard
             // 下一帧再撑到满宽 —— 那一下就是主人看到的「打开时闪一下」。
             ApplyWin10Geometry();
             LogHookState2($"boot geom={BootMs():0}ms");
+
+            // rail 上的头像小圆启动就要有，不等侧栏第一次展开
+            InitStartUser();
 
             _layout = LayoutStore.Load();
             LogHookState2($"boot layout={BootMs():0}ms tiles={_layout?.TileCount ?? 0}");
@@ -2669,6 +2766,9 @@ namespace TileBoard
             string LetterState() =>
                 $"op={LetterIndex.Opacity:0.00} sx={LetterIndexScale.ScaleX:0.000} vis={LetterIndex.Visibility}";
 
+            string PageState() =>
+                $"op={SettingsPage.Opacity:0.00} dx={(SettingsPage.RenderTransform as TranslateTransform)?.X ?? 0,6:0.0} vis={SettingsPage.Visibility}";
+
             Width = 1080;
             Height = 720;
 
@@ -2696,6 +2796,17 @@ namespace TileBoard
             await At(90, "letters", LetterState);
             await At(230, "letters", LetterState);
             await At(540, "letters", LetterState);
+
+            // ④ 整页（个性化）：与应用库同款淡入淡出
+            await Task.Delay(400);
+            sw.Restart();
+            ShowSettingsPage();
+            await At(80, "page", PageState);
+            await At(320, "page", PageState);
+            sw.Restart();          // 收起段单独起表，否则采样全落在第一帧
+            HideSettingsPage();
+            await At(60, "page", PageState);
+            await At(200, "page", PageState);
 
             HideLetterIndex(false);
             System.IO.File.WriteAllLines(path, log);
@@ -2736,7 +2847,9 @@ namespace TileBoard
             log.Add($"open  start={StartPane.Visibility} apps={AppsPanel.Visibility} " +
                     $"w={StartPane.ActualWidth:0} boxes={within} " +
                     $"lit={BtnApps.Background != Brushes.Transparent}");
-            log.Add($"nav   count={navs.Count} [{string.Join(",", navs)}] user={StartUser.Text}");
+            log.Add($"nav   count={navs.Count} [{string.Join(",", navs)}] " +
+                    $"user={StartUser.Text} avatar={(StartAvatar.Visibility == Visibility.Visible ? "img" : "glyph")} " +
+                    $"railavatar={(RailAvatar.Visibility == Visibility.Visible ? "img" : "glyph")}");
 
             // 互斥：点应用库，侧栏必须让位
             BtnLibrary_Click(this, null);
@@ -4913,9 +5026,11 @@ namespace TileBoard
             IntPtr fore = GetForegroundWindow();
             _fullscreenFore = IsFullscreenWindow(fore) ? fore : IntPtr.Zero;
 
-            // Win10 唤出开始菜单永远回到主界面，不会停在上次翻到的某一页
-            HideSettingsPage(false);
-            HidePhonePage();
+            // Win10 唤出开始菜单永远回到主界面，不会停在上次翻到的某一页。
+            // 唤出是瞬间事，页面动画演不完就被窗口盖走 —— 立即收。
+            SnapPageClosed(SettingsPage);
+            SnapPageClosed(PhonePage);
+            RestoreBoardIfPagesClosed();
 
             // 多屏：鼠标在哪块屏上按的唤出键，面板就出在哪块屏（Win10 开始菜单同款逻辑）。
             // 当初砍掉跨屏跳是因为以为闪在几何层，现在真凶（Topmost Z 序切换）已修，
@@ -8928,10 +9043,116 @@ namespace TileBoard
             ShowBoardSurface(BoardSurface);
 
             if (string.IsNullOrEmpty(StartUser.Text))
-                StartUser.Text = Environment.UserName;
+                InitStartUser();
 
             SetRailActive(BtnApps, true);
             AnimateStartPane(true);
+        }
+
+        /// <summary>侧栏底部用户行：全名 + 本机账号头像，只初始化一次。</summary>
+        private bool _accountInited;
+
+        private void InitStartUser()
+        {
+            if (_accountInited) return;
+            _accountInited = true;
+
+            // 全名走 secur32 的 NameDisplay，跟 Win10 开始菜单显示的一致；拿不到就退回登录名
+            string shown = GetAccountFullName();
+            StartUser.Text = string.IsNullOrEmpty(shown) ? Environment.UserName : shown;
+
+            // 头像：Windows 设账号头像时会生成多尺寸 jpg 落盘在 Public\AccountPictures\<SID>\。
+            // 读自己机器上的缓存文件，不需要任何授权；没有就保留人形剪影 glyph 兜底。
+            // 收起态 rail 的 BtnAvatar 和侧栏底部的用户行共用同一张图。
+            string avatar = FindAccountAvatar();
+            if (avatar != null)
+            {
+                try
+                {
+                    var src = new BitmapImage(new Uri(avatar));
+                    StartAvatar.Source = src;
+                    RailAvatar.Source = src;
+                    StartAvatar.Visibility = Visibility.Visible;
+                    RailAvatar.Visibility = Visibility.Visible;
+                    StartAvatarGlyph.Visibility = Visibility.Collapsed;
+                    RailAvatarGlyph.Visibility = Visibility.Collapsed;
+                }
+                catch { /* 图片坏了就还用 glyph，别为一个头像崩界面 */ }
+            }
+        }
+
+        /// <summary>当前账号的显示全名；本地账号未设置全名时返回空。</summary>
+        private static string GetAccountFullName()
+        {
+            try
+            {
+                var sb = new System.Text.StringBuilder(256);
+                uint size = (uint)sb.Capacity;
+                // NameDisplay = 3（secur32 的 EXTENDED_NAME_FORMAT）
+                if (GetUserNameEx(3, sb, ref size) && size > 0)
+                    return sb.ToString();
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>在本机缓存里找账号头像。找不到返回 null（用 glyph 兜底）。</summary>
+        private static string FindAccountAvatar()
+        {
+            // 按显示尺寸挑：侧栏头像只有 30px，96/240 足够清晰；1080 是给登录界面的大图
+            string[] sizes = { "Image240", "Image96", "Image448", "Image1080" };
+            try
+            {
+                string sid = System.Security.Principal.WindowsIdentity.GetCurrent().User?.Value;
+                if (string.IsNullOrEmpty(sid)) return null;
+
+                // Win10 主路径：C:\Users\Public\AccountPictures\<SID>\{GUID}-ImageNNN.jpg（文件名带生成时
+                // 的 GUID 前缀，得按通配符匹配，不能假设裸 ImageNNN.jpg）
+                string dir = System.IO.Path.Combine(@"C:\Users\Public\AccountPictures", sid);
+                if (System.IO.Directory.Exists(dir))
+                {
+                    foreach (var s in sizes)
+                    {
+                        var hits = System.IO.Directory.GetFiles(dir, "*" + s + ".jpg");
+                        if (hits.Length > 0) return hits[0];
+                    }
+                    // 命名意外的旧版本：目录里有 Image*.jpg 就挑最大的
+                    var any = System.IO.Directory.GetFiles(dir, "*Image*.jpg")
+                                  .OrderByDescending(f => new System.IO.FileInfo(f).Length)
+                                  .FirstOrDefault();
+                    if (any != null) return any;
+                }
+
+                // 老路径（Win7/8 时代）：C:\Users\Public\AccountPictures\ 下直接按 SID 命名的目录里没有，试试 Public 顶层
+                foreach (var s in sizes)
+                {
+                    string p = System.IO.Path.Combine(@"C:\Users\Public\AccountPictures", s + ".jpg");
+                    if (System.IO.File.Exists(p)) return p;
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        /// <summary>点用户行：跳系统「设置 → 账户 → 你的信息」，与 Win10 开始菜单行为一致。</summary>
+        private void StartUser_Click(object sender, MouseButtonEventArgs e)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo("ms-settings:yourinfo") { UseShellExecute = true });
+            }
+            catch { /* 打不开设置页就算了，不弹错 */ }
+            HideStartPane();
+        }
+
+        /// <param name="animate">
+        /// 板面整体收走（Win 键收起、退出）时传 false：那时窗口正在往下滑，
+        /// 侧栏还自己演一遍收拢就多余了，而且滑完窗口已经不可见，收尾回调没处落。
+        /// </param>
+        /// <summary>收起态 rail 的头像按钮：跟 Win10 一样，点了展开侧栏，用户区就在底部。</summary>
+        private void BtnAvatar_Click(object sender, RoutedEventArgs e)
+        {
+            ToggleStartPane();
         }
 
         /// <param name="animate">
@@ -9092,7 +9313,6 @@ namespace TileBoard
             {
                 case "library":    BtnLibrary_Click(this, null); break;
                 case "phone":      BtnPhone_Click(this, null); break;
-                case "tools":      BtnTools_Click(this, null); break;
                 case "appearance": BtnAppearance_Click(this, null); break;
                 case "quit":       BtnQuit_Click(this, null); break;
                 case "power":      BtnPower_Click(this, null); break;
@@ -9280,30 +9500,21 @@ namespace TileBoard
             catch (Exception ex) { SetStatus("打开文档失败：" + ex.Message); }
         }
 
-        private void BtnTools_Click(object sender, RoutedEventArgs e)
-        {
-            var menu = MakeMenu();
-
-            menu.Items.Add(MakePowerItem("新建分组", () => AddGroup_Click(this, null)));
-            menu.Items.Add(new Separator());
-
-            // 外观与尺寸的可调项已经全部收进「个性化」页，这里只留一个入口
-            menu.Items.Add(MakePowerItem("个性化设置…", ShowSettingsPage));
-            menu.Items.Add(new Separator());
-            menu.Items.Add(MakePowerItem("打开布局文件位置",
-                () => Run("explorer.exe", LayoutStore.Directory)));
-            menu.Items.Add(new Separator());
-            menu.Items.Add(MakePowerItem("退出磁贴板", Close));
-
-            menu.PlacementTarget = BtnTools;
-            menu.Placement = PlacementMode.Top;
-            menu.IsOpen = true;
-        }
-
         private void BtnSettings_Click(object sender, RoutedEventArgs e)
         {
             try { Process.Start(new ProcessStartInfo("ms-settings:") { UseShellExecute = true }); }
             catch (Exception ex) { SetStatus("打开设置失败：" + ex.Message); }
+        }
+
+        /// <summary>个性化页 → 布局文件：资源管理器打开布局所在目录。</summary>
+        private void OpenLayoutDir_Click(object sender, RoutedEventArgs e)
+        {
+            try
+            {
+                System.IO.Directory.CreateDirectory(LayoutStore.Directory);
+                Run("explorer.exe", LayoutStore.Directory);
+            }
+            catch (Exception ex) { SetStatus("打开布局目录失败：" + ex.Message); }
         }
 
         /// <summary>
