@@ -4438,8 +4438,13 @@ namespace TileBoard
                 StartGroupDrag(block.TranslatePoint(new Point(10, 10), this));
 
                 int cols = CurrentColumns();
-                int tc = Math.Max(0, cols - GroupGrid.SpanColumns(moving) - 1);
-                int tr = _layout.Groups.Where(g => g != null).Max(g => g.Row) + 1;
+
+                // 落点必须落在视口里，否则截图上什么都验证不到：
+                // 板面有三十多列、二十行，按「最大行 + 1」取会直接掉到屏幕下方，
+                // 跟随影像和网格特效都在看不到的地方。这里挑一块中上部的空地。
+                int visRows = (int)Math.Floor((ActualHeight - GroupGrid.HeaderHeight) / TileMetrics.Stride);
+                int tc = Math.Clamp(21, 0, Math.Max(0, cols - GroupGrid.SpanColumns(moving)));
+                int tr = Math.Clamp(6, 0, Math.Max(0, visRows - GroupGrid.SpanRows(moving) - 1));
 
                 Point origin = GroupsHost.TranslatePoint(new Point(0, 0), this);
                 UpdateGroupDrag(new Point(
@@ -6091,6 +6096,8 @@ namespace TileBoard
                 _groupGhost = null;
             }
 
+            HideSnapGrid();
+
             Mouse.Capture(null);
             RenderAll();
         }
@@ -6218,6 +6225,21 @@ namespace TileBoard
             GroupsHost.UpdateLayout();
 
             if (_groupDragBlock != null) _groupDragBlock.Opacity = 0;
+
+            // 分组也走磁贴那套圆形吸附网格：格线原点取板面原点（分组格位就是从那儿算的），
+            // 落点高亮框的是整块组的占位 —— 组有多宽多高，框就有多大，
+            // 用 Place 之后的实际格位画，被夹回边界时框也跟着回到真正会落下的地方
+            if (AppsPanel.Visibility == Visibility.Visible && IsOverAppsPanel(p))
+            {
+                HideSnapGrid();     // 指针压在应用库上：底下的板面看不见，画了也是对着空气
+            }
+            else
+            {
+                var g = _groupDragGroup;
+                ShowSnapGrid(p, null, g.Column, g.Row,
+                    new Size(GroupGrid.PixelWidth(g), GroupGrid.PixelHeight(g)),
+                    originAtBoard: true);
+            }
         }
 
         /// <summary>把全场分组恢复成拖动起点的格位。</summary>
@@ -6250,6 +6272,8 @@ namespace TileBoard
             }
 
             if (_groupDragBlock != null) _groupDragBlock.Opacity = 1;
+
+            HideSnapGrid();
 
             _groupDragGroup = null;
             _groupDragBlock = null;
@@ -6938,7 +6962,14 @@ namespace TileBoard
         /// 格线是照着「磁贴真正的落位节奏」画的 —— 组内从标题下沿起算，组外按板面原点，
         /// 所以看见的格子就是磁贴能停的地方，不是装饰。
         /// </summary>
-        private void ShowSnapGrid(Point cursor, TileGroup target, int col, int row)
+        /// <param name="slotSize">
+        /// 落点高亮的尺寸。传 null 走磁贴的跨度；拖分组时传组块尺寸，圆里框出的就是
+        /// 这块组要占的整片格子。给了尺寸但 target 为 null 时照样画高亮 —— 分组拖动的
+        /// 落点本来就按板面原点算，和「拖磁贴到组外」不是同一件事。
+        /// </param>
+        /// <param name="originAtBoard">格线原点固定取板面原点（分组用），不去找组内磁贴面板。</param>
+        private void ShowSnapGrid(Point cursor, TileGroup target, int col, int row,
+                                  Size? slotSize = null, bool originAtBoard = false)
         {
             double size = SnapCircleSize;
             double radius = size / 2;
@@ -6992,7 +7023,7 @@ namespace TileBoard
 
             Point host = GroupsHost.TranslatePoint(new Point(0, 0), this);
             Point origin;
-            if (target == null)
+            if (target == null || originAtBoard)
             {
                 origin = host;
             }
@@ -7027,7 +7058,7 @@ namespace TileBoard
 
             _snapLines.Data = BuildSnapLines(left, top, size, ox, oy);
 
-            if (target == null)
+            if (target == null && !slotSize.HasValue)
             {
                 if (_snapSlot != null) _snapSlot.Visibility = Visibility.Collapsed;
                 return;
@@ -7047,8 +7078,8 @@ namespace TileBoard
                 DragLayer.Children.Insert(0, _snapSlot);
             }
 
-            _snapSlot.Width = TileMetrics.Pixels(_dragItem?.SpanX ?? 2);
-            _snapSlot.Height = TileMetrics.Pixels(_dragItem?.SpanY ?? 2);
+            _snapSlot.Width = slotSize?.Width ?? TileMetrics.Pixels(_dragItem?.SpanX ?? 2);
+            _snapSlot.Height = slotSize?.Height ?? TileMetrics.Pixels(_dragItem?.SpanY ?? 2);
             _snapSlot.Visibility = Visibility.Visible;
             Canvas.SetLeft(_snapSlot, ox + col * TileMetrics.Stride);
             Canvas.SetTop(_snapSlot, oy + row * TileMetrics.Stride);
