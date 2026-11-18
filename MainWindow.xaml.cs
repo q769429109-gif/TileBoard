@@ -44,6 +44,15 @@ namespace TileBoard
         /// <summary>标题行显示的文字。</summary>
         public string HeaderText { get; set; }
 
+        /// <summary>
+        /// 这一行是不是「最近添加」。名字下面会多出一行小灰字，
+        /// 行高也随之变高 —— Win10 里这两处是同一个标记。
+        /// </summary>
+        public bool IsRecent { get; set; }
+
+        /// <summary>最近添加那一组自己的标题行，点它不会弹字母表。</summary>
+        public bool IsRecentHeader { get; set; }
+
         public BitmapSource Icon
         {
             get => _icon;
@@ -61,6 +70,23 @@ namespace TileBoard
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
 
         public event PropertyChangedEventHandler PropertyChanged;
+    }
+
+    /// <summary>
+    /// 字母索引面板里的一格。Win10 那三十格是：时钟（最近添加）、&amp;、#、A→Z、地球。
+    /// </summary>
+    public class LetterCell
+    {
+        /// <summary>点了它要跳到哪儿。recent / amp / num / other，字母组就是字母本身。</summary>
+        public string Key { get; set; }
+
+        /// <summary>显示的字形。时钟和地球是 Segoe MDL2 的图标码。</summary>
+        public string Text { get; set; }
+
+        public bool IsIcon { get; set; }
+
+        /// <summary>这一组有没有应用。没有的话显示成灰的，也不吃鼠标。</summary>
+        public bool Enabled { get; set; }
     }
 
     public partial class MainWindow : Window
@@ -586,6 +612,14 @@ namespace TileBoard
         {
             if (e.Key != Key.Escape) return;
 
+            // 字母索引浮层压在最上层：Esc 先收它，别一下把整个面板关掉
+            if (_letterOpen)
+            {
+                HideLetterIndex();
+                e.Handled = true;
+                return;
+            }
+
             // 文件夹展开面板最上层：Esc 先收它
             if (_folderOverlay != null)
             {
@@ -634,7 +668,14 @@ namespace TileBoard
                 return;
             }
 
-            if (AppsPanel.Visibility == Visibility.Visible)
+            if (_startPaneOpen)
+            {
+                HideStartPane();
+                e.Handled = true;
+                return;
+            }
+
+            if (_appsPanelOpen)
             {
                 HideAppsPanel();
                 e.Handled = true;
@@ -1111,6 +1152,12 @@ namespace TileBoard
         /// <summary>应用库的滚轮惯性：和板面同一档位、同一套衰减曲线。</summary>
         private void AppsList_PreviewMouseWheel(object sender, MouseWheelEventArgs e)
         {
+            // 手一滚就掐掉在途的字母跳转动画 —— 不掐的话它会一直把位置往回拽，
+            // 表现为「滚不动」或者「滚完自己弹回去」
+            ++_libScrollSeq;
+            _libScrollTimer?.Stop();
+            _libScrollTimer = null;
+
             double inertia = Math.Clamp(_ui.ScrollInertia, 0, 100);
             if (inertia <= 0) return;
 
@@ -1751,6 +1798,26 @@ namespace TileBoard
             // 调试/验收用：--shotapps <png> 打开应用库截图
             string appsShot = GetArg("--shotapps");
             if (appsShot != null) { await CaptureAppsShot(appsShot); return; }
+
+            // 调试/验收用：--starttest <txt> 验「所有应用」侧栏与其它面板的互斥
+            string startTestPath = GetArg("--starttest");
+            if (startTestPath != null) { RunStartTest(startTestPath); return; }
+
+            // 调试/验收用：--panetest <txt> 采样面板动画的中间态，确认不是瞬间到位
+            string paneTestPath = GetArg("--panetest");
+            if (paneTestPath != null) { RunPaneAnimTest(paneTestPath); return; }
+
+            // 调试/验收用：--shotstart <png> 展开三横线的「所有应用」侧栏后截图
+            string startShot = GetArg("--shotstart");
+            if (startShot != null) { await CaptureStartShot(startShot); return; }
+
+            // 调试/验收用：--shotletters <png> 打开应用库的字母索引浮层截图
+            string lettersShot = GetArg("--shotletters");
+            if (lettersShot != null) { await CaptureLettersShot(lettersShot); return; }
+
+            // 调试/验收用：--shotjump <png> 点字母跳转后截图，验「滚到该组标题」
+            string jumpShot = GetArg("--shotjump");
+            if (jumpShot != null) { await CaptureJumpShot(jumpShot); return; }
 
             // 调试/验收用：--groupshot <png> 看一眼未命名分组的标题隐藏与折叠态
             string groupShot = GetArg("--groupshot");
@@ -2576,6 +2643,120 @@ namespace TileBoard
         }
 
         /// <summary>
+        /// 动画自检：在几个时间点采样正在动的属性。截图看不出「是不是瞬间到位」，
+        /// 只能看宽度、透明度、缩放这些量有没有中间值 —— 有中间值才说明真在动。
+        /// </summary>
+        private async void RunPaneAnimTest(string path)
+        {
+            var log = new List<string>();
+            var sw = Stopwatch.StartNew();
+
+            async Task At(int at, string tag, Func<string> read)
+            {
+                int wait = (int)(at - sw.ElapsedMilliseconds);
+                if (wait > 0) await Task.Delay(wait);
+                log.Add($"{at,4}ms {tag}  {read()}");
+            }
+
+            string PaneState() =>
+                $"w={StartPane.Width,6:0.0}/{StartPane.ActualWidth:0.0} " +
+                $"alpha={((SolidColorBrush)StartPane.Background).Color.A,3} vis={StartPane.Visibility}";
+
+            string AppsState() =>
+                $"op={AppsPanel.Opacity:0.00} dx={(AppsPanel.RenderTransform as TranslateTransform)?.X ?? 0,6:0.0} " +
+                $"vis={AppsPanel.Visibility}";
+
+            string LetterState() =>
+                $"op={LetterIndex.Opacity:0.00} sx={LetterIndexScale.ScaleX:0.000} vis={LetterIndex.Visibility}";
+
+            Width = 1080;
+            Height = 720;
+
+            // 等首屏那轮枚举收工：UI 线程忙的时候，采样点会全部落到动画之后，什么也测不出来
+            await Task.Delay(3000);
+
+            // ① 侧栏展开：48 → 258，220ms，底色同时 0 → 255
+            sw.Restart();
+            BtnApps_Click(this, null);
+            await At(70, "pane", PaneState);
+            await At(150, "pane", PaneState);
+            await At(420, "pane", PaneState);
+
+            // ② 收起侧栏 + 应用库进场：位移 -18 → 0、透明度 0 → 1
+            sw.Restart();
+            BtnLibrary_Click(this, null);
+            await At(70, "apps", AppsState);
+            await At(150, "apps", AppsState);
+            await At(330, "apps", AppsState);
+
+            // ③ 字母索引：1.22 → 1.0，400ms
+            await Task.Delay(400);
+            sw.Restart();
+            ShowLetterIndex();
+            await At(90, "letters", LetterState);
+            await At(230, "letters", LetterState);
+            await At(540, "letters", LetterState);
+
+            HideLetterIndex(false);
+            System.IO.File.WriteAllLines(path, log);
+            Close();
+        }
+
+        /// <summary>
+        /// 侧边栏展开自检：
+        ///   ① 三横线点开后面板在、宽版按钮数与侧边栏上的一致、用户名字有值；
+        ///   ② 和应用库面板互斥 —— 各自点开时对方必须让位；
+        ///   ③ 收起后三横线那颗的压亮要退掉。
+        /// </summary>
+        private async void RunStartTest(string path)
+        {
+            var log = new List<string>();
+
+            BtnApps_Click(this, null);
+            await Task.Delay(600);
+
+            // 宽版按钮都在 StackPanel 里（不虚拟化），布局跑完就在视觉树上
+            StartPane.UpdateLayout();
+            var navs = new List<string>();
+            void Walk(DependencyObject node)
+            {
+                int n = VisualTreeHelper.GetChildrenCount(node);
+                for (int i = 0; i < n; i++)
+                {
+                    var child = VisualTreeHelper.GetChild(node, i);
+                    if (child is Border b && b.Tag is string t) navs.Add(t);
+                    Walk(child);
+                }
+            }
+            Walk(StartPane);
+
+            bool within = StartPane.ActualWidth > 0 &&
+                          StartPane.TranslatePoint(new Point(StartPane.ActualWidth, 0), this).X <= Width;
+
+            log.Add($"open  start={StartPane.Visibility} apps={AppsPanel.Visibility} " +
+                    $"w={StartPane.ActualWidth:0} boxes={within} " +
+                    $"lit={BtnApps.Background != Brushes.Transparent}");
+            log.Add($"nav   count={navs.Count} [{string.Join(",", navs)}] user={StartUser.Text}");
+
+            // 互斥：点应用库，侧栏必须让位
+            BtnLibrary_Click(this, null);
+            await Task.Delay(500);
+            log.Add($"lib   start={StartPane.Visibility} apps={AppsPanel.Visibility} " +
+                    $"lit={BtnLibrary.Background != Brushes.Transparent}");
+
+            // 再点三横线，应用库必须让位
+            BtnApps_Click(this, null);
+            await Task.Delay(500);
+            log.Add($"back  start={StartPane.Visibility} apps={AppsPanel.Visibility}");
+
+            HideStartPane(false);
+            log.Add($"hide  start={StartPane.Visibility} lit={BtnApps.Background != Brushes.Transparent}");
+
+            System.IO.File.WriteAllLines(path, log);
+            Close();
+        }
+
+        /// <summary>
         /// 应用库自检：
         ///   ① 面板能开、行数与目录对得上；
         ///   ② 每一行的字母组和 NameIndex 算出来的一致，标题不重复、不跳序；
@@ -2614,9 +2795,9 @@ namespace TileBoard
                           $"行数={rows.Count}  应用={apps.Count}  字母段={headers.Count}  " +
                           $"已在板上={apps.Count(a => a.IsPinned)}");
 
-                // 字母段必须严格递增（# 在最前），不能有重复段
+                // 字母段必须严格递增（最近添加 → & → # → A…），不能有重复段
                 bool ordered = true;
-                int lastRank = -1;
+                int lastRank = int.MinValue;
                 foreach (var h in headers)
                 {
                     int rank = NameIndex.Rank(h.Letter);
@@ -2809,13 +2990,106 @@ namespace TileBoard
             Application.Current.Shutdown();
         }
 
+        /// <summary>把字母索引浮层拍下来：整窗一张 + 浮层本体一张，顺便把最近添加写进日志。</summary>
+        private async Task CaptureLettersShot(string path)
+        {
+            Width = 1080;
+            Height = 720;
+
+            BtnLibrary_Click(this, null);
+
+            // 多等一会：后台那轮枚举要跑三四秒，最近添加的时间戳是那时才回填的
+            await Task.Delay(5200);
+
+            var rows = AppsList.ItemsSource as List<AppRow> ?? new List<AppRow>();
+            var recent = rows.Where(r => r.IsRecent).ToList();
+            LogHookState2($"LetterIndex rows={rows.Count} recent={recent.Count} " +
+                          $"[{string.Join(", ", recent.Take(6).Select(r => r.Name))}] " +
+                          $"firstRow={rows.FirstOrDefault()?.HeaderText}");
+
+            ShowLetterIndex();
+            await Task.Delay(650);      // 等 400ms 的收拢动画走完，别拍到中间态
+
+            RevealForCapture();
+            LetterIndex.UpdateLayout();
+
+            string stem = System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(path) ?? ".",
+                System.IO.Path.GetFileNameWithoutExtension(path));
+
+            CaptureElement(LetterIndex, stem + "-only.png");
+
+            await CaptureAndExit(path);
+        }
+
+        /// <summary>
+        /// 验字母跳转：依次跳 J 和「最近添加」，各拍一张面板。
+        /// 图上该组的标题应该顶在列表最上面 —— Win10 就是把这个标题滚到顶部。
+        /// </summary>
+        private async Task CaptureJumpShot(string path)
+        {
+            Width = 1080;
+            Height = 720;
+
+            BtnLibrary_Click(this, null);
+            await Task.Delay(5200);
+
+            string stem = System.IO.Path.Combine(
+                System.IO.Path.GetDirectoryName(path) ?? ".",
+                System.IO.Path.GetFileNameWithoutExtension(path));
+
+            foreach (var key in new[] { "J", "recent" })
+            {
+                ScrollLibraryTo(key);
+                await Task.Delay(700);      // 等滑动动画落定再拍，读到的偏移才是终点
+
+                var rows = AppsList.ItemsSource as List<AppRow> ?? new List<AppRow>();
+                var sv = FindDescendant<ScrollViewer>(AppsList);
+                string head = FirstVisibleRowName(sv, rows);
+
+                LogHookState2($"LetterJump key={key} offset={sv?.VerticalOffset:0} top={head}");
+
+                RevealForCapture();
+                AppsPanel.UpdateLayout();
+                CaptureElement(AppsPanel, stem + "-" + key + ".png");
+            }
+
+            await CaptureAndExit(path);
+        }
+
+        /// <summary>取当前视口最上面那一行是什么 —— 跳转跳没跳对，只看这个。</summary>
+        private string FirstVisibleRowName(ScrollViewer sv, List<AppRow> rows)
+        {
+            if (sv == null) return "(no scrollviewer)";
+
+            double top = sv.VerticalOffset;
+
+            for (int i = 0; i < rows.Count; i++)
+            {
+                if (AppsList.ItemContainerGenerator.ContainerFromIndex(i) is not ListBoxItem item)
+                {
+                    // 虚拟化没生成的容器数不清位置，直接拿数据行高估一个：标题 34、普通 32
+                    continue;
+                }
+
+                Point p = item.TransformToVisual(sv.Content as Visual).Transform(new Point(0, 0));
+                if (p.Y >= -1)
+                {
+                    var row = rows[i];
+                    return $"#{i} {(row.IsHeader ? "[" + row.HeaderText + "]" : row.Name)} y={p.Y:0}";
+                }
+            }
+
+            return $"(offset={top:0}, 没有可见行)";
+        }
+
         /// <summary>把应用库面板的样子拍下来。宽度临时拉大，才看得到「左边列表、右边磁贴」的关系。</summary>
         private async Task CaptureAppsShot(string path)
         {
             Width = 1080;
             Height = 720;
 
-            BtnApps_Click(this, null);
+            BtnLibrary_Click(this, null);
             await Task.Delay(1600);
 
             LogHookState2($"AppsPanel w={AppsPanel.ActualWidth:0} h={AppsPanel.ActualHeight:0} " +
@@ -2827,6 +3101,25 @@ namespace TileBoard
 
             // 整窗一张 + 面板本体一张：整屏缩略图看不清 12.5px 的字母标题
             CaptureElement(AppsPanel,
+                System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path) ?? ".",
+                                       System.IO.Path.GetFileNameWithoutExtension(path) + "-only.png"));
+
+            await CaptureAndExit(path);
+        }
+
+        /// <summary>三横线那份「所有应用」侧栏：整窗一张 + 侧栏本体一张。</summary>
+        private async Task CaptureStartShot(string path)
+        {
+            BtnApps_Click(this, null);
+            await Task.Delay(700);
+
+            LogHookState2($"StartPane w={StartPane.ActualWidth:0} h={StartPane.ActualHeight:0} " +
+                          $"vis={StartPane.Visibility} user={StartUser.Text}");
+
+            RevealForCapture();
+            StartPane.UpdateLayout();
+
+            CaptureElement(StartPane,
                 System.IO.Path.Combine(System.IO.Path.GetDirectoryName(path) ?? ".",
                                        System.IO.Path.GetFileNameWithoutExtension(path) + "-only.png"));
 
@@ -4839,6 +5132,10 @@ namespace TileBoard
             // 文件夹那层浮盖先收掉：它挂在 RootGrid 上，会跟着窗口一起滑走，
             // 下次唤出还挂在那儿
             CloseFolder();
+
+            // 三横线那份名单同理：Win10 每次打开开始菜单都是收起的，不留上次的面儿。
+            // 这里不给动画：窗口紧接着就往下滑，侧栏再自己演一遍收拢纯属多余
+            HideStartPane(false);
 
             _hiding = true;
             int token = ++_fadeToken;
@@ -8597,35 +8894,342 @@ namespace TileBoard
             }
         }
 
-        private void BtnApps_Click(object sender, RoutedEventArgs e) => ToggleAppsPanel();
+        private void BtnApps_Click(object sender, RoutedEventArgs e) => ToggleStartPane();
 
-        /// <summary>侧边栏新加的那颗「应用库」，和上面那颗进的是同一个查看器。</summary>
+        /// <summary>侧边栏底部那颗「应用库」：搜索、拖到板上，跟「所有应用」名单是两套。</summary>
         private void BtnLibrary_Click(object sender, RoutedEventArgs e) => ToggleAppsPanel();
+
+        // ================= 展开后的侧边栏（三横线） =================
+
+        /// <summary>侧栏展开态的逻辑状态。动画途中 Visibility 还是 Visible，不能拿它当判据。</summary>
+        private bool _startPaneOpen;
+
+        /// <summary>侧栏动画代次：中途反向时，上一轮排好的收尾不许再执行。</summary>
+        private int _paneSeq;
+
+        /// <summary>展开后的宽度（XAML 写的是同一个值，这里留个常量给动画当终点）。</summary>
+        private const double PaneWide = 258;
+
+        /// <summary>收起态的宽度 —— 正好是图标栏那一列，所以面板起手那一刻和图标栏严丝合缝。</summary>
+        private const double PaneNarrow = 48;
+
+        private void ToggleStartPane()
+        {
+            if (_startPaneOpen) HideStartPane();
+            else ShowStartPane();
+        }
+
+        private void ShowStartPane()
+        {
+            // 三个面板共用板面左侧这一条，同时站着会叠成重影
+            if (AppsPanel.Visibility == Visibility.Visible) HideAppsPanel(false);
+            HideSettingsPage(false);
+            HidePhonePage();
+            ShowBoardSurface(BoardSurface);
+
+            if (string.IsNullOrEmpty(StartUser.Text))
+                StartUser.Text = Environment.UserName;
+
+            SetRailActive(BtnApps, true);
+            AnimateStartPane(true);
+        }
+
+        /// <param name="animate">
+        /// 板面整体收走（Win 键收起、退出）时传 false：那时窗口正在往下滑，
+        /// 侧栏还自己演一遍收拢就多余了，而且滑完窗口已经不可见，收尾回调没处落。
+        /// </param>
+        private void HideStartPane(bool animate = true)
+        {
+            if (StartPane == null || !_startPaneOpen) return;
+
+            _startPaneOpen = false;
+            SetRailActive(BtnApps, false);
+
+            if (!animate)
+            {
+                SnapStartPaneClosed();
+                return;
+            }
+
+            AnimateStartPane(false);
+        }
+
+        /// <summary>
+        /// 侧栏展开 / 收起。
+        ///
+        /// 宽度从 48 长到 258，底色同时从全透明推到不透明。两件事必须一起做：
+        /// 收起态宽度正好压在图标栏上，底色要是硬切，那一瞬会先闪出一条比图标栏
+        /// 更深的竖条，再摊开 —— 看上去像闪了一下。跟着宽度一起长，眼睛看到的是
+        /// 同一块面在摊开。文字比宽度晚 50ms 才亮，先看见面在长，再看见字。
+        /// </summary>
+        private void AnimateStartPane(bool show)
+        {
+            _startPaneOpen = show;
+            int seq = ++_paneSeq;
+
+            var brush = StartPane.Background as SolidColorBrush;
+            if (brush == null || brush.IsFrozen)
+            {
+                brush = new SolidColorBrush(Color.FromArgb(0, 0x1F, 0x1F, 0x1F));
+                StartPane.Background = brush;
+            }
+
+            StartPane.BeginAnimation(UIElement.OpacityProperty, null);
+            StartPane.Opacity = 1;
+            StartPane.Visibility = Visibility.Visible;
+            StartPane.IsHitTestVisible = show;
+
+            if (show)
+            {
+                // 起手先把宽度按到窄态、底色按到全透明，再往上推 —— 上一轮残留的
+                // 持有动画会顶住本地值，所以先清掉
+                StartPane.BeginAnimation(WidthProperty, null);
+                StartPane.Width = PaneNarrow;
+                brush.BeginAnimation(SolidColorBrush.ColorProperty, null);
+                brush.Color = Color.FromArgb(0, 0x1F, 0x1F, 0x1F);
+            }
+
+            int ms = show ? 220 : 160;
+
+            var width = new DoubleAnimation(show ? PaneWide : PaneNarrow,
+                TimeSpan.FromMilliseconds(ms))
+            {
+                EasingFunction = new CubicEase
+                {
+                    EasingMode = show ? EasingMode.EaseOut : EasingMode.EaseIn
+                }
+            };
+
+            var tint = new ColorAnimation(
+                Color.FromArgb(show ? (byte)0xFF : (byte)0x00, 0x1F, 0x1F, 0x1F),
+                TimeSpan.FromMilliseconds(ms))
+            {
+                EasingFunction = new CubicEase
+                {
+                    EasingMode = show ? EasingMode.EaseOut : EasingMode.EaseIn
+                }
+            };
+
+            if (StartPane.Child is FrameworkElement inner)
+            {
+                if (show) inner.Opacity = 0;
+
+                var fade = new DoubleAnimation(show ? 1 : 0,
+                    TimeSpan.FromMilliseconds(show ? 170 : 90))
+                {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                };
+                if (show) fade.BeginTime = TimeSpan.FromMilliseconds(50);
+
+                inner.BeginAnimation(UIElement.OpacityProperty, fade);
+            }
+
+            if (!show)
+            {
+                width.Completed += (s, e) =>
+                {
+                    if (seq != _paneSeq) return;
+                    SnapStartPaneClosed();
+                };
+            }
+
+            StartPane.BeginAnimation(WidthProperty, width);
+            brush.BeginAnimation(SolidColorBrush.ColorProperty, tint);
+        }
+
+        /// <summary>不管动画走到哪儿，直接落到「收起来」的终态，并把动画痕迹清干净。</summary>
+        private void SnapStartPaneClosed()
+        {
+            if (StartPane == null) return;
+
+            _startPaneOpen = false;
+            _paneSeq++;
+
+            StartPane.BeginAnimation(WidthProperty, null);
+            StartPane.Width = PaneWide;
+            StartPane.Visibility = Visibility.Collapsed;
+            StartPane.IsHitTestVisible = true;
+
+            if (StartPane.Child is FrameworkElement inner)
+            {
+                inner.BeginAnimation(UIElement.OpacityProperty, null);
+                inner.Opacity = 1;
+            }
+
+            if (StartPane.Background is SolidColorBrush brush)
+            {
+                brush.BeginAnimation(SolidColorBrush.ColorProperty, null);
+                brush.Color = Color.FromArgb(0xFF, 0x1F, 0x1F, 0x1F);
+            }
+        }
+
+        private void StartToggle_Click(object sender, MouseButtonEventArgs e) => HideStartPane();
+
+        /// <summary>
+        /// 点侧栏外面就收起来 —— Win10 的开始菜单也是这个脾气。
+        /// 只收面板、不吞事件：点在磁贴或侧栏按钮上，那一击照常生效。
+        /// </summary>
+        private void RootGrid_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (StartPane == null || !_startPaneOpen) return;
+            if (StartPane.IsMouseOver) return;
+
+            HideStartPane();
+        }
+
+        /// <summary>
+        /// 展开栏里那几行就是侧边栏按钮的宽版：Tag 是它的名字。
+        /// 先收起面板，再交给原来那颗按钮的活 —— 两边共用一套实现，不会走偏。
+        /// </summary>
+        private void StartNav_Click(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is not FrameworkElement fe) return;
+            if (fe.Tag is not string tag) return;
+
+            HideStartPane();
+
+            switch (tag)
+            {
+                case "library":    BtnLibrary_Click(this, null); break;
+                case "phone":      BtnPhone_Click(this, null); break;
+                case "tools":      BtnTools_Click(this, null); break;
+                case "appearance": BtnAppearance_Click(this, null); break;
+                case "quit":       BtnQuit_Click(this, null); break;
+                case "power":      BtnPower_Click(this, null); break;
+
+                case "docs":
+                case "pics":
+                case "settings":
+                    try
+                    {
+                        string target = tag switch
+                        {
+                            "docs" => Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
+                            "pics" => Environment.GetFolderPath(Environment.SpecialFolder.MyPictures),
+                            _      => "ms-settings:"
+                        };
+                        Process.Start(new ProcessStartInfo(target) { UseShellExecute = true });
+                        HideBoard();
+                    }
+                    catch (Exception ex) { SetStatus("打开失败：" + ex.Message); }
+                    break;
+            }
+        }
 
         private void AppsClose_Click(object sender, RoutedEventArgs e) => HideAppsPanel();
 
+        /// <summary>应用库面板的逻辑开关。淡出期间 Visibility 还是 Visible，不能拿它当判据。</summary>
+        private bool _appsPanelOpen;
+
+        /// <summary>面板动画代次：连续开关时，前一轮的收尾作废。</summary>
+        private int _appsSeq;
+
         private void ToggleAppsPanel()
         {
-            if (AppsPanel.Visibility == Visibility.Visible) HideAppsPanel();
+            if (_appsPanelOpen) HideAppsPanel();
             else ShowAppsPanel();
         }
 
         private void ShowAppsPanel()
         {
+            if (_startPaneOpen) HideStartPane();
+
             HideSettingsPage(false);
             HidePhonePage();
             ShowBoardSurface(BoardSurface);   // 板面必须在场：这里是要把应用拖上去的
             UpdateAppsPanelWidth();
 
-            SetRailActive(BtnApps, true);
             SetRailActive(BtnLibrary, true);
 
             // 先清空搜索框再显示：反过来的话 TextChanged 会先填一遍，下面又填一遍
             SearchBox.Text = string.Empty;
-            AppsPanel.Visibility = Visibility.Visible;
 
+            // 铺名单这一步是同步的，几百行排下来会占住 UI 线程一小会。
+            // 必须铺完再启动动画 —— 反过来的话动画时钟在铺名单期间就空转了，
+            // 等界面松开手，淡入已经算完，看起来就是「啪」地整块出现。
+            AppsPanel.Visibility = Visibility.Visible;
+            AppsPanel.Opacity = 0;
             FillLibrary(string.Empty);
+
+            // 把这块大布局先吃掉：四百多行第一次铺出来本身就要一两百毫秒，
+            // 让它在看不见的时候吃完，动画才有帧可走
+            AppsPanel.UpdateLayout();
+
+            AnimateAppsPanel(true);
             SearchBox.Focus();
+        }
+
+        /// <summary>
+        /// 应用库面板的进出：从左边推 18px 进来 + 淡入。位移压在 18px 以内是刻意的 ——
+        /// 它是贴着图标栏长出来的，推得太远整块面板会在图标栏上划过去，像多盖了一层。
+        /// </summary>
+        private void AnimateAppsPanel(bool show)
+        {
+            _appsPanelOpen = show;
+            int seq = ++_appsSeq;
+
+            var shift = AppsPanel.RenderTransform as TranslateTransform;
+            if (shift == null)
+            {
+                shift = new TranslateTransform();
+                AppsPanel.RenderTransform = shift;
+            }
+
+            AppsPanel.Visibility = Visibility.Visible;
+            AppsPanel.IsHitTestVisible = show;
+
+            if (show)
+            {
+                // 上一轮持有动画会顶住本地值，先清掉再摆起手姿态
+                AppsPanel.BeginAnimation(UIElement.OpacityProperty, null);
+                AppsPanel.Opacity = 0;
+
+                shift.BeginAnimation(TranslateTransform.XProperty, null);
+                shift.X = -18;
+            }
+
+            var fade = new DoubleAnimation(show ? 1 : 0,
+                TimeSpan.FromMilliseconds(show ? 190 : 130))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+
+            var slide = new DoubleAnimation(show ? 0 : -14,
+                TimeSpan.FromMilliseconds(show ? 240 : 140))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+
+            if (!show)
+            {
+                fade.Completed += (s, e) =>
+                {
+                    if (seq != _appsSeq) return;
+                    SnapAppsPanelClosed();
+                };
+            }
+
+            AppsPanel.BeginAnimation(UIElement.OpacityProperty, fade);
+            shift.BeginAnimation(TranslateTransform.XProperty, slide);
+        }
+
+        private void SnapAppsPanelClosed()
+        {
+            if (AppsPanel == null) return;
+
+            _appsPanelOpen = false;
+            _appsSeq++;
+
+            AppsPanel.BeginAnimation(UIElement.OpacityProperty, null);
+            AppsPanel.Opacity = 1;
+            AppsPanel.Visibility = Visibility.Collapsed;
+            AppsPanel.IsHitTestVisible = true;
+
+            if (AppsPanel.RenderTransform is TranslateTransform shift)
+            {
+                shift.BeginAnimation(TranslateTransform.XProperty, null);
+                shift.X = 0;
+            }
         }
 
         /// <summary>
@@ -8646,14 +9250,21 @@ namespace TileBoard
         /// </param>
         private void HideAppsPanel(bool restoreBoard = true)
         {
-            bool wasOpen = AppsPanel.Visibility == Visibility.Visible;
+            if (AppsPanel == null) return;
 
-            AppsPanel.Visibility = Visibility.Collapsed;
-            SetRailActive(BtnApps, false);
+            bool wasOpen = _appsPanelOpen;
+
+            // 面板收了，压在上面的索引浮层不能留在半空；跟着一起走，不单独演淡出
+            HideLetterIndex(false);
+
+            _appsPanelOpen = false;
             SetRailActive(BtnLibrary, false);
 
             _listMouseDown = false;
             _listDragRow = null;
+
+            if (wasOpen) AnimateAppsPanel(false);
+            else if (AppsPanel.Visibility == Visibility.Visible) SnapAppsPanelClosed();
 
             if (wasOpen && restoreBoard && !_dragging) ShowBoardSurface(BoardSurface);
         }
@@ -8865,7 +9476,41 @@ namespace TileBoard
                        ?? Enumerable.Empty<string>(),
                 StringComparer.OrdinalIgnoreCase);
 
-            var rows = new List<AppRow>(apps.Count + 24);
+            // 「最近添加」：Win10 把它摆在整个字母表前面，同一批应用在各自的字母组里
+            // 还会再出现一次，名字下面带一行「最近添加」小字。
+            // 搜索时不插 —— 搜出来的东西按相关性排，插个最近添加反而碍事。
+            var recent = string.IsNullOrWhiteSpace(filter)
+                ? _catalog.RecentAdded()
+                : new List<Native.NativeShell.AppEntry>();
+
+            var recentSet = new HashSet<string>(
+                recent.Select(a => a.Aumid), StringComparer.OrdinalIgnoreCase);
+
+            var rows = new List<AppRow>(apps.Count + 32);
+
+            if (recent.Count > 0)
+            {
+                rows.Add(new AppRow
+                {
+                    IsHeader = true,
+                    IsRecentHeader = true,
+                    Letter = '\0',
+                    HeaderText = "最近添加",
+                    Name = "最近添加"
+                });
+
+                foreach (var app in recent)
+                {
+                    rows.Add(new AppRow
+                    {
+                        Aumid = app.Aumid,
+                        Name = app.Name,
+                        Letter = NameIndex.Group(app.Name),
+                        IsPinned = onBoard.Contains(app.Aumid)
+                    });
+                }
+            }
+
             char current = '\0';
 
             foreach (var item in apps)
@@ -8890,6 +9535,7 @@ namespace TileBoard
                     Aumid = app.Aumid,
                     Name = app.Name,
                     Letter = letter,
+                    IsRecent = recentSet.Contains(app.Aumid),
                     IsPinned = onBoard.Contains(app.Aumid)
                 });
             }
@@ -8915,16 +9561,295 @@ namespace TileBoard
             });
         }
 
+        // ================= 字母索引面板 =================
+
+        /// <summary>
+        /// 按当前列表内容铺出字母表。三十格固定：时钟、&amp;、#、A→Z、地球；
+        /// 哪一组真的应用才亮，其余的给灰 —— 和 Win10 里空组的表现一致。
+        /// </summary>
+        private void BuildLetterIndex()
+        {
+            var rows = AppsList?.ItemsSource as List<AppRow>;
+
+            var present = new HashSet<char>();
+            bool hasRecent = false;
+
+            if (rows != null)
+            {
+                foreach (var r in rows)
+                {
+                    if (r.IsRecentHeader) hasRecent = true;
+                    else if (r.IsHeader && r.Letter != '\0') present.Add(r.Letter);
+                }
+            }
+
+            var cells = new List<LetterCell>(30)
+            {
+                new LetterCell { Key = "recent", Text = "\uE823", IsIcon = true, Enabled = hasRecent },
+                new LetterCell { Key = "amp",    Text = "&",      Enabled = present.Contains('&') },
+                new LetterCell { Key = "num",    Text = "#",      Enabled = present.Contains('#') }
+            };
+
+            for (char c = 'A'; c <= 'Z'; c++)
+            {
+                cells.Add(new LetterCell
+                {
+                    Key = c.ToString(),
+                    Text = c.ToString(),
+                    Enabled = present.Contains(c)
+                });
+            }
+
+            // 地球 = 「其他语言」那一组。列表里没有这类应用，就一直是灰的 ——
+            // Win10 没装外语应用时也是这个状态
+            cells.Add(new LetterCell { Key = "other", Text = "\uE774", IsIcon = true, Enabled = false });
+
+            LetterIndexGrid.ItemsSource = cells;
+        }
+
+        /// <summary>索引浮层的逻辑开关。淡出期间 Visibility 还是 Visible，Esc 判断要用它。</summary>
+        private bool _letterOpen;
+
+        private int _letterSeq;
+
+        /// <summary>
+        /// 弹出索引。两件事同时发生，和 Win10 录屏里一模一样：
+        ///   ① 整块（连压暗底板）170ms 淡进来 —— 底下的列表先被压暗，字母才浮上来；
+        ///   ② 字母网格从 1.22 收到 1.0，用 400ms 慢慢收。
+        /// 只做淡入会显得「凭空出现」，只做缩放又会糊成一团；
+        /// 快淡入 + 慢收拢，落到眼里的顺序才是「先看见东西，再看见它归位」。
+        /// </summary>
+        private void ShowLetterIndex()
+        {
+            BuildLetterIndex();
+
+            _letterOpen = true;
+            ++_letterSeq;
+
+            LetterIndex.Visibility = Visibility.Visible;
+            LetterIndex.IsHitTestVisible = true;
+
+            LetterIndex.BeginAnimation(UIElement.OpacityProperty, null);
+            LetterIndex.Opacity = 0;
+
+            LetterIndex.BeginAnimation(UIElement.OpacityProperty,
+                new DoubleAnimation(1, TimeSpan.FromMilliseconds(170))
+                {
+                    EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+                });
+
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+            LetterIndexScale.ScaleX = 1.22;
+            LetterIndexScale.ScaleY = 1.22;
+
+            var zoom = new DoubleAnimation(1.0, TimeSpan.FromMilliseconds(400))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleXProperty, zoom);
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleYProperty, zoom);
+        }
+
+        /// <param name="animate">
+        /// 面板收起时传 false：整块面板都在淡出了，索引再单独淡一次只是多拖 130ms，
+        /// 而且它压在面板上，会让人看到「面板半透明里还挂着一层网格」。
+        /// </param>
+        private void HideLetterIndex(bool animate = true)
+        {
+            if (LetterIndex == null || !_letterOpen) return;
+
+            _letterOpen = false;
+            int seq = ++_letterSeq;
+
+            if (!animate)
+            {
+                SnapLetterIndexClosed();
+                return;
+            }
+
+            LetterIndex.IsHitTestVisible = false;
+
+            var fade = new DoubleAnimation(0, TimeSpan.FromMilliseconds(130))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+            fade.Completed += (s, e) =>
+            {
+                if (seq != _letterSeq) return;
+                SnapLetterIndexClosed();
+            };
+
+            LetterIndex.BeginAnimation(UIElement.OpacityProperty, fade);
+
+            // 收的时候反向微涨一点，跟出来时的收拢对上，像从哪儿来回哪儿去
+            var zoom = new DoubleAnimation(1.06, TimeSpan.FromMilliseconds(160))
+            {
+                EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
+            };
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleXProperty, zoom);
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleYProperty, zoom);
+        }
+
+        private void SnapLetterIndexClosed()
+        {
+            if (LetterIndex == null) return;
+
+            _letterOpen = false;
+            _letterSeq++;
+
+            LetterIndex.BeginAnimation(UIElement.OpacityProperty, null);
+            LetterIndex.Opacity = 0;
+            LetterIndex.Visibility = Visibility.Collapsed;
+            LetterIndex.IsHitTestVisible = true;
+
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleXProperty, null);
+            LetterIndexScale.BeginAnimation(ScaleTransform.ScaleYProperty, null);
+            LetterIndexScale.ScaleX = 1;
+            LetterIndexScale.ScaleY = 1;
+        }
+
+        private void LetterIndex_BackdropUp(object sender, MouseButtonEventArgs e)
+        {
+            // 字母格自己把事件 handled 掉了，能冒到这里的都是面板空白处
+            HideLetterIndex();
+        }
+
+        private void LetterCell_Click(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is not FrameworkElement fe || fe.DataContext is not LetterCell cell) return;
+            if (!cell.Enabled) return;
+
+            e.Handled = true;
+            ScrollLibraryTo(cell.Key);
+            HideLetterIndex();
+        }
+
+        /// <summary>
+        /// 把列表滚到某一组的标题上。Win10 的做法是把这一组的标题顶到列表顶端，
+        /// 不是「保证露脸」—— ScrollIntoView 只做后者，所以滚完再拿容器的实际位置补一下。
+        ///
+        /// 补这一下不能直接跳：Win10 里点字母表是靠一段短促的滑动把列表带过去的，
+        /// 硬跳会让人分不清「我点的那一格生效了没有」。所以先量出目标偏移，
+        /// 退回原位，再按 EaseOutCubic 滑过去。
+        /// </summary>
+        private void ScrollLibraryTo(string key)
+        {
+            if (AppsList?.ItemsSource is not List<AppRow> rows) return;
+
+            AppRow target;
+            switch (key)
+            {
+                case "recent":
+                    target = rows.FirstOrDefault(r => r.IsRecentHeader);
+                    break;
+                case "num":
+                    target = rows.FirstOrDefault(r => r.IsHeader && r.Letter == NameIndex.Other);
+                    break;
+                case "amp":
+                    target = rows.FirstOrDefault(r => r.IsHeader && r.Letter == NameIndex.Symbol);
+                    break;
+                default:
+                    target = key.Length == 1
+                        ? rows.FirstOrDefault(r => r.IsHeader && r.Letter == key[0])
+                        : null;
+                    break;
+            }
+
+            if (target == null) return;
+
+            var sv = FindDescendant<ScrollViewer>(AppsList);
+            if (sv == null) return;
+
+            double from = sv.VerticalOffset;
+
+            AppsList.ScrollIntoView(target);
+            AppsList.UpdateLayout();
+
+            var item = AppsList.ItemContainerGenerator.ContainerFromItem(target) as ListBoxItem;
+            if (sv.Content is not Visual content || item == null) return;
+
+            Point p = item.TransformToVisual(content).Transform(new Point(0, 0));
+            double to = Math.Clamp(sv.VerticalOffset + p.Y, 0, sv.ScrollableHeight);
+
+            // 回到点之前的位置，动画才看得见「从哪儿滑到哪儿」
+            sv.ScrollToVerticalOffset(from);
+            SlideLibraryTo(sv, from, to);
+        }
+
+        /// <summary>在途的列表滚动动画代次。滚轮一动就作废，别跟用户抢滚动条。</summary>
+        private int _libScrollSeq;
+
+        private System.Windows.Threading.DispatcherTimer _libScrollTimer;
+
+        /// <summary>
+        /// 按真实时间推列表偏移，12ms 一跳 + EaseOutCubic。
+        /// 用定时器而不是 Storyboard：ScrollViewer.VerticalOffset 是只读的，
+        /// 只能一格一格 ScrollToVerticalOffset。距离越远给的时间越长一点，
+        /// 但上限 420ms —— 再长就成了「等它滑完」，不像 Win10。
+        /// </summary>
+        private void SlideLibraryTo(ScrollViewer sv, double from, double to)
+        {
+            _libScrollTimer?.Stop();
+            _libScrollTimer = null;
+
+            int seq = ++_libScrollSeq;
+
+            if (Math.Abs(to - from) < 1)
+            {
+                sv.ScrollToVerticalOffset(to);
+                return;
+            }
+
+            double ms = Math.Clamp(190 + Math.Abs(to - from) * 0.30, 190, 420);
+            var sw = Stopwatch.StartNew();
+
+            var timer = new System.Windows.Threading.DispatcherTimer(
+                System.Windows.Threading.DispatcherPriority.Render)
+            {
+                Interval = TimeSpan.FromMilliseconds(12)
+            };
+
+            timer.Tick += (s, e) =>
+            {
+                if (seq != _libScrollSeq)
+                {
+                    timer.Stop();
+                    if (_libScrollTimer == timer) _libScrollTimer = null;
+                    return;
+                }
+
+                double t = Math.Min(1.0, sw.Elapsed.TotalMilliseconds / ms);
+                double k = EaseOutCubic(t);
+                sv.ScrollToVerticalOffset(from + (to - from) * k);
+
+                if (t >= 1.0)
+                {
+                    timer.Stop();
+                    if (_libScrollTimer == timer) _libScrollTimer = null;
+                }
+            };
+
+            _libScrollTimer = timer;
+            timer.Start();
+        }
+
         /// <summary>从鼠标事件里捞出它落在哪一行；落在标题或空白上返回 null。</summary>
         private static AppRow RowFromEvent(MouseEventArgs e)
+        {
+            var row = AnyRowFromEvent(e);
+            return row == null || row.IsHeader ? null : row;
+        }
+
+        /// <summary>连标题行一起捞 —— 点字母标题要弹索引，那一步不能把标题滤掉。</summary>
+        private static AppRow AnyRowFromEvent(MouseEventArgs e)
         {
             var el = e.OriginalSource as DependencyObject;
 
             while (el != null && el is not ListBoxItem)
                 el = VisualTreeHelper.GetParent(el);
 
-            var row = (el as ListBoxItem)?.DataContext as AppRow;
-            return row == null || row.IsHeader ? null : row;
+            return (el as ListBoxItem)?.DataContext as AppRow;
         }
 
         private void AppsList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -8959,6 +9884,14 @@ namespace TileBoard
 
         private void AppsList_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
+            // 点在字母标题上：弹字母索引。Win10 里点 # A B… 就是这个反应
+            if (AnyRowFromEvent(e) is { IsHeader: true })
+            {
+                ShowLetterIndex();
+                e.Handled = true;
+                return;
+            }
+
             if (!_listMouseDown || _listDragRow == null) return;
 
             AppRow row = _listDragRow;
@@ -9193,7 +10126,6 @@ namespace TileBoard
             // 列表不动。以前这里会先把面板收起来「让出落点」，代价是拖完一次就得
             // 重新点开一次应用库 —— 连续摆十块磁贴要点十次。面板留着，落点交给
             // UpdateDrag 里那段「指针还在面板上就别解析」来兜。
-            SetRailActive(BtnApps, true);
             SetRailActive(BtnLibrary, true);
 
             Mouse.Capture(this, CaptureMode.Element);

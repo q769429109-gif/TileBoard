@@ -35,6 +35,49 @@ namespace TileBoard.Services
         {
             public string Aumid { get; set; }
             public string Name { get; set; }
+
+            /// <summary>第一次在本机见到它的时间（Unix 毫秒）。0 = 缓存格式升级前就在的老应用。</summary>
+            public long FirstSeen { get; set; }
+        }
+
+        /// <summary>
+        /// 每个应用「第一次被枚举到」的时间。Win10 开始菜单顶部那块「最近添加」就是
+        /// 靠它挑人的 —— 我们这边 shell:AppsFolder 给不出安装时间，只能自己记。
+        ///
+        /// 缓存格式升级前就存在的应用一律记 0（老应用），不参与「最近添加」；
+        /// 只有装完软件后重新枚举才第一次出现在清单里的，才拿到真实时间。
+        /// 这样第一次跑这版不会四百多个应用全被当成新的。
+        /// </summary>
+        private readonly Dictionary<string, long> _firstSeen =
+            new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// 还没有任何可信时间戳（全新安装，或旧缓存里 FirstSeen 全是 0）：
+        /// 下一次真枚举时要补一轮基线 —— 桌面应用问 exe 的创建时间，
+        /// 而不是把四百多个应用统统记成「刚装」。
+        /// 首屏读缓存那一步不能做（一百多次文件 IO 会堵住启动），只有后台枚举才补。
+        /// </summary>
+        private bool _needsBaselineBackfill = true;
+
+        public long FirstSeenOf(string aumid)
+        {
+            if (string.IsNullOrEmpty(aumid)) return 0;
+            return _firstSeen.TryGetValue(aumid, out var t) ? t : 0;
+        }
+
+        /// <summary>
+        /// 最近添加的应用，新的在前。窗口天数与条数按 Win10 的观感取：
+        /// 三十天内装的东西才叫「最近」，一次最多列出八条，再多就把列表顶出一屏。
+        /// </summary>
+        public List<NativeShell.AppEntry> RecentAdded(int days = 30, int max = 8)
+        {
+            long since = DateTimeOffset.Now.AddDays(-days).ToUnixTimeMilliseconds();
+
+            return All
+                .Where(a => a != null && FirstSeenOf(a.Aumid) >= since)
+                .OrderByDescending(a => FirstSeenOf(a.Aumid))
+                .Take(max)
+                .ToList();
         }
 
         /// <summary>
@@ -51,33 +94,99 @@ namespace TileBoard.Services
                     System.IO.File.ReadAllText(CachePath));
                 if (rows == null || rows.Count == 0) return;
 
+                // 整份记录都是 0 = 这套机制之前写的旧缓存，还没有任何时间戳。
+                // 补基线的活留给后台那轮枚举（见 Apply），首屏不做文件 IO
+                _needsBaselineBackfill = rows.All(r => r.FirstSeen == 0);
+
+                foreach (var r in rows)
+                    if (!string.IsNullOrEmpty(r.Aumid)) _firstSeen[r.Aumid] = r.FirstSeen;
+
                 var list = rows
                     .Where(r => !string.IsNullOrEmpty(r.Aumid))
                     .Select(r => new NativeShell.AppEntry { Aumid = r.Aumid, Name = r.Name ?? "" })
                     .OrderBy(a => a.Name, StringComparer.CurrentCulture)
                     .ToList();
 
-                if (list.Count > 0) Apply(list);
+                if (list.Count > 0) Apply(list, stamp: false);
             }
             catch { }
         }
 
-        private void Apply(List<NativeShell.AppEntry> list)
+        /// <param name="stamp">
+        /// 要不要顺手记时间戳。读缓存那一步传 false —— 字典里已经是缓存里的值，
+        /// 再走一遍补基线就是一百多次文件 IO，而这时候还在启动路径上。
+        /// </param>
+        private void Apply(List<NativeShell.AppEntry> list, bool stamp = true)
         {
+            if (stamp)
+            {
+                long now = DateTimeOffset.Now.ToUnixTimeMilliseconds();
+
+                foreach (var e in list)
+                {
+                    if (string.IsNullOrEmpty(e.Aumid)) continue;
+
+                    bool known = _firstSeen.TryGetValue(e.Aumid, out long seen);
+
+                    if (_needsBaselineBackfill)
+                    {
+                        // 补基线：0 表示「不知道什么时候装的」，先问 exe 自己；
+                        // 问不出来（UWP）就留 0，当老应用，不进最近添加
+                        if (seen <= 0)
+                        {
+                            long guess = GuessInstalledAt(e.Aumid);
+                            if (guess > 0) _firstSeen[e.Aumid] = guess;
+                            else if (!known) _firstSeen[e.Aumid] = 0;
+                        }
+                    }
+                    else if (!known)
+                    {
+                        // 清单里新冒出来的：不管 UWP 还是桌面应用，它就是「刚装上」
+                        _firstSeen[e.Aumid] = now;
+                    }
+                }
+
+                _needsBaselineBackfill = false;
+            }
+
             All = list;
             _byAumid.Clear();
             foreach (var e in list) _byAumid[e.Aumid] = e;
             Loaded = true;
         }
 
-        private static void SaveCache(List<NativeShell.AppEntry> list)
+        /// <summary>
+        /// 猜一个桌面应用的安装时间。shell:AppsFolder 不提供安装日期，UWP 那边更拿不到，
+        /// 所以只对「Aumid 就是路径」的桌面应用取 exe 的创建时间 —— 装软件时它才被写出来，
+        /// 是能拿到的最接近的答案。UWP 与原始资料都给不出的，记 0（当老应用，不进最近添加）。
+        /// </summary>
+        private static long GuessInstalledAt(string aumid)
+        {
+            try
+            {
+                if (!NativeShell.LooksLikePath(aumid)) return 0;
+
+                var info = new System.IO.FileInfo(aumid);
+                if (!info.Exists) return 0;
+
+                return new DateTimeOffset(info.CreationTimeUtc).ToUnixTimeMilliseconds();
+            }
+            catch { return 0; }
+        }
+
+        private void SaveCache(List<NativeShell.AppEntry> list)
         {
             try
             {
                 System.IO.Directory.CreateDirectory(LayoutStore.Directory);
                 var rows = list
                     .Where(a => !string.IsNullOrEmpty(a.Aumid))
-                    .Select(a => new CacheRow { Aumid = a.Aumid, Name = a.Name })
+                    .Select(a => new CacheRow
+                    {
+                        Aumid = a.Aumid,
+                        Name = a.Name,
+                        FirstSeen = FirstSeenOf(a.Aumid)
+                    })
                     .ToList();
                 System.IO.File.WriteAllText(CachePath,
                     System.Text.Json.JsonSerializer.Serialize(rows));

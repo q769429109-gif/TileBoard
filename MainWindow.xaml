@@ -14,7 +14,8 @@
         TextOptions.TextFormattingMode="Display"
         FontFamily="Microsoft YaHei UI, Segoe UI">
 
-    <Grid x:Name="RootGrid" Background="Transparent" Opacity="0" RenderTransformOrigin="0.5,0.5">
+    <Grid x:Name="RootGrid" Background="Transparent" Opacity="0" RenderTransformOrigin="0.5,0.5"
+          PreviewMouseLeftButtonDown="RootGrid_PreviewMouseLeftButtonDown">
         <!-- 淡入用的位移：窗口一出现就在 10px 下方，然后再升上来。
              透明度和位移都挂在根容器而不是 Window 上 —— 分层窗口动 Window.Opacity
              会每帧重建整窗位图，表现就是「先闪一下再出现」。 -->
@@ -55,17 +56,19 @@
         <Border Grid.Column="0" Background="{StaticResource RailBack}">
             <Grid>
                 <StackPanel VerticalAlignment="Top" Margin="0,6,0,0">
+                    <!-- 三横线 = Win10 的「所有应用」：点开左栏展开成 258 宽的名单 -->
                     <Button x:Name="BtnApps" Style="{StaticResource RailButton}"
-                            Content="&#xE700;" ToolTip="所有应用（Win10 字母表）"
+                            Content="&#xE700;" ToolTip="开始"
                             Click="BtnApps_Click"/>
-                    <Button x:Name="BtnLibrary" Style="{StaticResource RailButton}"
-                            Content="&#xE8F1;" ToolTip="应用库"
-                            Click="BtnLibrary_Click"/>
                 </StackPanel>
 
                 <StackPanel VerticalAlignment="Bottom" Margin="0,0,0,10">
+                    <!-- 应用库：可搜索、可把应用拖到板上。和上面的「所有应用」是两套界面 -->
+                    <Button x:Name="BtnLibrary" Style="{StaticResource RailButton}"
+                            Content="&#xE8F1;" ToolTip="应用库"
+                            Click="BtnLibrary_Click"/>
                     <Button x:Name="BtnPhone" Style="{StaticResource RailButton}"
-                            Content="&#xE8EA;" ToolTip="手机连接" Click="BtnPhone_Click"/>
+                            Content="&#xE8EA;" ToolTip="移动设备" Click="BtnPhone_Click"/>
                     <Button x:Name="BtnDocuments" Style="{StaticResource RailButton}"
                             Content="&#xE8B7;" ToolTip="文档" Click="BtnDocuments_Click"/>
                     <Button x:Name="BtnTools" Style="{StaticResource RailButton}"
@@ -131,7 +134,7 @@
                               Padding="30,10,30,30">
                     <StackPanel MaxWidth="520" HorizontalAlignment="Left">
 
-                        <TextBlock Text="手机连接" FontSize="24" FontWeight="SemiBold"
+                        <TextBlock Text="移动设备" FontSize="24" FontWeight="SemiBold"
                                    Foreground="White"/>
                         <TextBlock Text="这台电脑配对的手机，状态与最近通知"
                                    FontSize="12.5" Foreground="#9A9A9A" Margin="0,5,0,0"/>
@@ -366,8 +369,8 @@
                                                Foreground="#A8A8A8"/>
                                 </Border>
 
-                                <Border x:Name="Row" Height="32" CornerRadius="2"
-                                        Margin="6,0,6,0" Padding="8,0,8,0"
+                                <Border x:Name="Row" MinHeight="32" CornerRadius="2"
+                                        Margin="6,0,6,0" Padding="8,4,8,4"
                                         Background="Transparent">
                                     <Grid>
                                         <Grid.ColumnDefinitions>
@@ -380,10 +383,18 @@
                                                Margin="0,0,12,0" VerticalAlignment="Center"
                                                RenderOptions.BitmapScalingMode="HighQuality"/>
 
-                                        <TextBlock Grid.Column="1" Text="{Binding Name}"
-                                                   FontSize="12.5" Foreground="#EDEDED"
-                                                   VerticalAlignment="Center"
-                                                   TextTrimming="CharacterEllipsis"/>
+                                        <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                            <TextBlock Text="{Binding Name}"
+                                                       FontSize="12.5" Foreground="#EDEDED"
+                                                       VerticalAlignment="Center"
+                                                       TextTrimming="CharacterEllipsis"/>
+
+                                            <!-- 最近添加的应用：名字下面挂一行小字，Win10 同款 -->
+                                            <TextBlock x:Name="RecentMark" Text="最近添加"
+                                                       FontSize="10" Foreground="#8C8C8C"
+                                                       Margin="0,3,0,0"
+                                                       Visibility="Collapsed"/>
+                                        </StackPanel>
 
                                         <TextBlock x:Name="PinMark" Grid.Column="2" Text="已在板上"
                                                    FontSize="10.5" Foreground="#7A7A7A"
@@ -397,6 +408,10 @@
                                     <Setter TargetName="Hdr" Property="Visibility" Value="Visible"/>
                                     <Setter TargetName="Row" Property="Visibility" Value="Collapsed"/>
                                 </DataTrigger>
+                                <DataTrigger Binding="{Binding IsRecent}" Value="True">
+                                    <Setter TargetName="RecentMark" Property="Visibility" Value="Visible"/>
+                                    <Setter TargetName="Row" Property="MinHeight" Value="46"/>
+                                </DataTrigger>
                                 <DataTrigger Binding="{Binding IsPinned}" Value="True">
                                     <Setter TargetName="PinMark" Property="Visibility" Value="Visible"/>
                                 </DataTrigger>
@@ -407,6 +422,254 @@
                         </DataTemplate>
                     </ListBox.ItemTemplate>
                 </ListBox>
+
+                <!-- ============ 字母索引浮层 ============
+                     点应用库里的字母标题弹出来，和 Win10 一样 4 列：第一排是
+                     「时钟 / & / # / A」，最后两格是 Z 和地球。没有应用的字母是灰的，
+                     点它也不动 —— Win10 里那几个空组就是这副样子。
+                     悬停那一格会亮出方框和四道向外伸的短线，这是索引面板的点睛处。 -->
+                <Grid x:Name="LetterIndex" Grid.RowSpan="2" Visibility="Collapsed"
+                      Background="#EA1E1E1E" Opacity="0"
+                      MouseLeftButtonUp="LetterIndex_BackdropUp">
+
+                    <ItemsControl x:Name="LetterIndexGrid"
+                                  HorizontalAlignment="Center" VerticalAlignment="Center"
+                                  Width="240" Margin="0,0,0,8"
+                                  RenderTransformOrigin="0.5,0.5"
+                                  IsHitTestVisible="True">
+                        <!-- 出现时从 1.22 缩到 1：Win10 的索引面板是从略大的一版收进来的，
+                             不是原地淡出来。缩放挂在网格上，压暗的底板不跟着缩。 -->
+                        <ItemsControl.RenderTransform>
+                            <ScaleTransform x:Name="LetterIndexScale" ScaleX="1" ScaleY="1"/>
+                        </ItemsControl.RenderTransform>
+                        <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                                <UniformGrid Columns="4"/>
+                            </ItemsPanelTemplate>
+                        </ItemsControl.ItemsPanel>
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Grid x:Name="Cell" Height="58" Background="Transparent"
+                                      MouseLeftButtonUp="LetterCell_Click">
+
+                                    <Border x:Name="Frame" Margin="3" CornerRadius="1"
+                                            BorderThickness="1" BorderBrush="Transparent"
+                                            Background="Transparent"/>
+
+                                    <TextBlock x:Name="Glyph" Text="{Binding Text}"
+                                               FontSize="13.5" Foreground="#FFFFFF"
+                                               HorizontalAlignment="Center" VerticalAlignment="Center"
+                                               IsHitTestVisible="False"/>
+
+                                    <!-- 悬停时从四边向外伸出的短线，Win10 索引面板的记号 -->
+                                    <Rectangle x:Name="LineT" Width="1" Height="7" Fill="#3DFFFFFF"
+                                               HorizontalAlignment="Center" VerticalAlignment="Top"
+                                               Margin="0,-8,0,0" Visibility="Collapsed"
+                                               IsHitTestVisible="False"/>
+                                    <Rectangle x:Name="LineB" Width="1" Height="7" Fill="#3DFFFFFF"
+                                               HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                               Margin="0,0,0,-8" Visibility="Collapsed"
+                                               IsHitTestVisible="False"/>
+                                    <Rectangle x:Name="LineL" Width="7" Height="1" Fill="#3DFFFFFF"
+                                               HorizontalAlignment="Left" VerticalAlignment="Center"
+                                               Margin="-8,0,0,0" Visibility="Collapsed"
+                                               IsHitTestVisible="False"/>
+                                    <Rectangle x:Name="LineR" Width="7" Height="1" Fill="#3DFFFFFF"
+                                               HorizontalAlignment="Right" VerticalAlignment="Center"
+                                               Margin="0,0,-8,0" Visibility="Collapsed"
+                                               IsHitTestVisible="False"/>
+                                </Grid>
+
+                                <DataTemplate.Triggers>
+                                    <!-- 空组：字变灰，并且收不到鼠标（点了也不该有反应） -->
+                                    <DataTrigger Binding="{Binding Enabled}" Value="False">
+                                        <Setter TargetName="Glyph" Property="Foreground" Value="#6A6A6A"/>
+                                        <Setter TargetName="Cell" Property="IsHitTestVisible" Value="False"/>
+                                    </DataTrigger>
+
+                                    <!-- 时钟与地球用系统字形，字号比字母大一号才压得住 -->
+                                    <DataTrigger Binding="{Binding IsIcon}" Value="True">
+                                        <Setter TargetName="Glyph" Property="FontFamily" Value="Segoe MDL2 Assets"/>
+                                        <Setter TargetName="Glyph" Property="FontSize" Value="16"/>
+                                    </DataTrigger>
+
+                                    <Trigger SourceName="Cell" Property="IsMouseOver" Value="True">
+                                        <Setter TargetName="Frame" Property="BorderBrush" Value="#38FFFFFF"/>
+                                        <Setter TargetName="Frame" Property="Background" Value="#0FFFFFFF"/>
+                                        <Setter TargetName="LineT" Property="Visibility" Value="Visible"/>
+                                        <Setter TargetName="LineB" Property="Visibility" Value="Visible"/>
+                                        <Setter TargetName="LineL" Property="Visibility" Value="Visible"/>
+                                        <Setter TargetName="LineR" Property="Visibility" Value="Visible"/>
+                                    </Trigger>
+                                </DataTemplate.Triggers>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </Grid>
+            </Grid>
+        </Border>
+
+        <!-- ============ 展开后的左侧栏 ============
+             Win10 里点左上角三横线，做的是「把左边那条图标栏拉开」：本来只有图标，
+             拉开后每个按钮旁边露出它的名字，上面还有当前用户的名字。
+             三横线自己叫「开始」，不是又一个应用库入口 —— 应用库有它自己那颗书本图标。
+
+             按钮留在底部不挪位置：收起时它们就在那儿，展开只是同一条栏长胖了。
+             要是把它们挪到顶部，看起来就成了「另开一个面板」，而不是「这条栏展开」。
+
+             为什么用覆盖层而不是真把侧栏加宽：板面列数按宽度现算，宽一挤就得重排格位，
+             主人摆好的磁贴会被搅散。它贴着左边缘长出来，看不出接缝，代价小得多。 -->
+        <Border x:Name="StartPane" Grid.Column="0" Grid.ColumnSpan="2"
+                HorizontalAlignment="Left" Width="258"
+                Background="#FF1F1F1F"
+                BorderBrush="#1AFFFFFF" BorderThickness="0,0,1,0"
+                ClipToBounds="True"
+                Visibility="Collapsed">
+            <Grid>
+                <Grid.Resources>
+                    <!-- 宽版按钮：悬停给一层淡淡底色，跟系统菜单一个手感 -->
+                    <Style x:Key="StartNavItem" TargetType="Border">
+                        <Setter Property="Height" Value="40"/>
+                        <Setter Property="Background" Value="Transparent"/>
+                        <Setter Property="Cursor" Value="Hand"/>
+                        <Style.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#2A2A2A"/>
+                            </Trigger>
+                        </Style.Triggers>
+                    </Style>
+                </Grid.Resources>
+
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
+                </Grid.RowDefinitions>
+
+                <!-- 标题行：三横线 + 开始。在这儿再点一下就收回去 -->
+                <Border Grid.Row="0" Height="48" Background="#FF1F1F1F"
+                        Cursor="Hand" ToolTip="收起侧边栏"
+                        MouseLeftButtonUp="StartToggle_Click">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                        <TextBlock Text="&#xE700;" FontFamily="Segoe MDL2 Assets" FontSize="14"
+                                   Foreground="#FFFFFF" VerticalAlignment="Center"
+                                   IsHitTestVisible="False"/>
+                        <TextBlock Text="开始" FontSize="13" Foreground="#FFFFFF"
+                                   Margin="18,0,0,0" VerticalAlignment="Center"
+                                   IsHitTestVisible="False"/>
+                    </StackPanel>
+                </Border>
+
+                <!-- 底部：当前用户 + 侧边栏那几颗按钮的宽版 -->
+                <StackPanel Grid.Row="1" VerticalAlignment="Bottom" Margin="0,0,0,10">
+                    <Border Height="1" Background="#14FFFFFF" Margin="0,0,0,10"/>
+
+                    <Grid Height="44" Margin="16,0,16,4" Background="Transparent">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+
+                        <Border Width="30" Height="30" CornerRadius="15" Background="#3A3A3A"
+                                VerticalAlignment="Center">
+                            <TextBlock Text="&#xE77B;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#D8D8D8"
+                                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+
+                        <TextBlock x:Name="StartUser" Grid.Column="1" Text=""
+                                   FontSize="12.5" Foreground="#EDEDED"
+                                   VerticalAlignment="Center" Margin="12,0,0,0"
+                                   TextTrimming="CharacterEllipsis"/>
+                    </Grid>
+                    <Border Style="{StaticResource StartNavItem}" Tag="library"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE8F1;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="应用库" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource StartNavItem}" Tag="phone"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE8EA;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="移动设备" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource StartNavItem}" Tag="docs"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE8B7;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="文档" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource StartNavItem}" Tag="tools"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE712;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="工具" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource StartNavItem}" Tag="appearance"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE790;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="个性化" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource StartNavItem}" Tag="settings"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="Windows 设置" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource StartNavItem}" Tag="quit"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="退出磁贴板" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource StartNavItem}" Tag="power"
+                            MouseLeftButtonUp="StartNav_Click">
+                        <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="16,0,0,0">
+                            <TextBlock Text="&#xE7E8;" FontFamily="Segoe MDL2 Assets" FontSize="15"
+                                       Foreground="#EDEDED" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                            <TextBlock Text="电源" FontSize="12.5" Foreground="#EDEDED"
+                                       Margin="16,0,0,0" VerticalAlignment="Center"
+                                       IsHitTestVisible="False"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
             </Grid>
         </Border>
 
