@@ -7248,16 +7248,6 @@ namespace TileBoard
 
             menu.Items.Add(new Separator());
 
-            var import = new MenuItem { Header = "导入 Win10 布局…", Icon = MenuIcon("\uE8B5") };
-            import.Click += (s, ev) => Import_Click(this, null);
-            menu.Items.Add(import);
-
-            var regenerate = new MenuItem { Header = "按本机应用重新生成", Icon = MenuIcon("\uE72C") };
-            regenerate.Click += (s, ev) => Generate_Click(this, null);
-            menu.Items.Add(regenerate);
-
-            menu.Items.Add(new Separator());
-
             var openDir = new MenuItem { Header = "打开布局文件位置", Icon = MenuIcon("\uE8B7") };
             openDir.Click += (s, ev) => Run("explorer.exe", LayoutStore.Directory);
             menu.Items.Add(openDir);
@@ -8343,82 +8333,6 @@ namespace TileBoard
 
         // ================= 顶部按钮 =================
 
-        private void Import_Click(object sender, RoutedEventArgs e)
-        {
-            string path = Win10LayoutImporter.DetectLayoutFile();
-
-            _suppressHide = true;
-            try
-            {
-                if (path == null)
-                {
-                    var dlg = new Microsoft.Win32.OpenFileDialog
-                    {
-                        Title = "选择 Windows 10 磁贴布局文件",
-                        Filter = "布局 XML (*.xml)|*.xml|所有文件 (*.*)|*.*"
-                    };
-                    if (dlg.ShowDialog(this) != true) return;
-                    path = dlg.FileName;
-                }
-
-                if (!_catalog.Loaded)
-                {
-                    MessageBox.Show(this, "应用清单还没加载完，稍等一下再试。", "磁贴板");
-                    return;
-                }
-
-                var result = Win10LayoutImporter.Import(path, _catalog);
-
-                if (!result.Ok)
-                {
-                    MessageBox.Show(this, "导入失败：" + result.Error, "磁贴板");
-                    return;
-                }
-
-                _layout = result.Layout;
-                Save();
-                RenderAll();
-
-                string msg = $"来源：{result.VariantInfo}\n" +
-                             $"解析出 {result.GroupCount} 个分组、{result.TileCount} 个磁贴。\n" +
-                             $"其中 {result.ResolvedCount} 个在本机存在，{result.Missing.Count} 个已失效。";
-
-                if (result.Missing.Count > 0)
-                {
-                    msg += "\n\n失效项（保留为占位磁贴，不会丢失布局）：\n" +
-                           string.Join("\n", result.Missing.Take(10)) +
-                           (result.Missing.Count > 10 ? $"\n… 以及另外 {result.Missing.Count - 10} 个" : "");
-                }
-
-                MessageBox.Show(this, msg, "导入结果");
-                SetStatus($"已导入 {result.TileCount} 个磁贴，其中 {result.ResolvedCount} 个可用");
-            }
-            finally
-            {
-                _suppressHide = false;
-            }
-        }
-
-        private void Generate_Click(object sender, RoutedEventArgs e)
-        {
-            _suppressHide = true;
-            try
-            {
-                var answer = MessageBox.Show(this,
-                    "这会用本机应用重新生成整块板面，当前布局会被覆盖。继续吗？",
-                    "磁贴板", MessageBoxButton.OKCancel, MessageBoxImage.Question);
-                if (answer != MessageBoxResult.OK) return;
-            }
-            finally
-            {
-                _suppressHide = false;
-            }
-
-            GenerateFromCatalog();
-            RenderAll();
-            SetStatus($"已按本机 {_catalog.All.Count} 个应用重新生成");
-        }
-
         private void AddGroup_Click(object sender, RoutedEventArgs e)
         {
             if (_layout == null) return;
@@ -8728,8 +8642,6 @@ namespace TileBoard
         {
             var menu = MakeMenu();
 
-            menu.Items.Add(MakePowerItem("导入 Win10 布局…", () => Import_Click(this, null)));
-            menu.Items.Add(MakePowerItem("按本机应用重新生成", () => Generate_Click(this, null)));
             menu.Items.Add(MakePowerItem("新建分组", () => AddGroup_Click(this, null)));
             menu.Items.Add(new Separator());
 
